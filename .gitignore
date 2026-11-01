@@ -1,0 +1,7 @@
+# MIMIC-derived text: never commit (PhysioNet DUA). Copy to the cluster with scp.
+data/
+# run outputs (contain model scores per MIMIC case) and slurm logs
+results/
+runs/
+__pycache__/
+.DS_Store
