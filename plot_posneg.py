@@ -128,8 +128,11 @@ def per_case_sections(beh, sel, pat):
         "## Per case: patching", "",
         "leave_layer = first layer where patching the differing token alone moves < half of the "
         "P-N gap (the information has been handed on to later positions). "
-        "asym = mean over layers 5-11 of recovery(noise) - recovery(denoise) at the differing token: "
-        "> 0 means, with mixed signals, the answer follows the NEGATIVE side; < 0, the positive side.", "",
+        "asym = mean over layers 5-11 of recovery(noise) - recovery(denoise) at the differing token. "
+        "> 0: N's notes placed in the P run keep moving the answer at these layers more than P's "
+        "notes placed in the N run. Two readings, not yet separated: the HOST run still reads the "
+        "position (P run reads it longer), or the CONTENT draws reads (N's notes get attended longer). "
+        "Separate them with attention weights at full-attention layers 7 and 11.", "",
         pp.sort_values(["form", "test", "case"]).to_markdown(index=False, floatfmt=".2f"), "",
     ]
 
