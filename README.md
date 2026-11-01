@@ -67,7 +67,7 @@ git clone git@github.com:duruoli/medical-llm-interpretability.git ~/AAA/medical-
 conda create -p $PROJ/envs/interp python=3.10 -y && conda activate $PROJ/envs/interp
 pip install torch --index-url https://download.pytorch.org/whl/cu126   # CUDA 12 wheel; see note
 pip install -r requirements.txt
-huggingface-cli download Qwen/Qwen3.5-9B
+hf download Qwen/Qwen3.5-9B   # huggingface_hub>=1.0 renamed huggingface-cli to hf
 ```
 
 Note on torch: a plain `pip install torch` pulls the newest CUDA-13 wheel, which may be too new
