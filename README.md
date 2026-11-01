@@ -102,7 +102,7 @@ Three measurements in one run (~10 min on an A100; fine in an interactive sessio
 - distance between P and N residual streams per layer x segment ("is it there" vs "is it used")
 
 ```
-python -u mechanism_posneg.py --model Qwen/Qwen3.5-9B
+sbatch mechanism_posneg.slurm        # or, in an interactive session: python -u mechanism_posneg.py --model Qwen/Qwen3.5-9B
 ```
 
 Results land in `results/mech/Qwen3.5-9B/`.
