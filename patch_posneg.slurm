@@ -2,13 +2,9 @@
 
 # Positive vs negative evidence: behavior + residual-stream activation patching on Qwen3.5-9B.
 # Submit from the repo root on Quest:  sbatch patch_posneg.slurm
-# One-time setup on a login node, in a SEPARATE env `interp` (Qwen3.5 needs transformers>=5.2;
-# upgrading `congraph` could break the Qwen3-30B jobs that pin an older transformers):
-#   conda create -n interp python=3.10 -y && conda activate interp
-#   pip install torch "transformers>=5.2" accelerate nnsight pandas matplotlib tabulate
-#   huggingface-cli download Qwen/Qwen3.5-9B              # ~19 GB; HF_HUB_OFFLINE=1 below
-#   optional speed-up (CUDA build, skip if it fails; the torch fallback works):
-#   pip install flash-linear-attention causal-conv1d
+# One-time setup: see README "Running on Quest". The env, pip cache and HF cache all live
+# under /projects/$PROJ, NOT $HOME (home quota ~80 GB fills up: Errno 122 Disk quota exceeded).
+# Separate env because Qwen3.5 needs transformers>=5.2 and `congraph` pins an older one.
 # Inputs:  data/posneg_pool.jsonl  (built locally by build_posneg_cases.py)
 # Output:  results/posneg/Qwen3.5-9B/   then run plot_posneg.py on it
 
@@ -26,19 +22,21 @@
 #SBATCH --mail-type=ALL
 #SBATCH --mail-user=duruoli2024@u.northwestern.edu
 
+PROJ=/projects/p31777
+
 module purge all
 source "$HOME/miniconda/bin/activate"
-conda activate interp
+conda activate "$PROJ/envs/interp"
 export LD_LIBRARY_PATH="$CONDA_PREFIX/lib:$LD_LIBRARY_PATH"
 
-cd /home/dlf8982/AAA/medical-llm-interpretability
+cd "$SLURM_SUBMIT_DIR"                               # = repo root you ran sbatch from
 mkdir -p runs results/posneg
 
 echo "Job started at: $(date)   Node: $(hostname)   Job ID: $SLURM_JOB_ID"
 python --version
 nvidia-smi
 
-export HF_HOME="$HOME/.cache/huggingface"
+export HF_HOME="$PROJ/.cache/huggingface"
 export HF_HUB_OFFLINE=1
 export TOKENIZERS_PARALLELISM=false
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True

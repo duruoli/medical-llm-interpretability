@@ -54,14 +54,26 @@ scp data/posneg_pool.jsonl <quest>:/home/dlf8982/AAA/medical-llm-interpretabilit
 
 ## Running on Quest
 
+Put the conda env, pip cache and model weights under the project allocation, **not** `$HOME`.
+The home quota (~80 GB) fills up: torch + CUDA libs are several GB and Qwen3.5-9B is ~19 GB.
+Symptom: `OSError: [Errno 122] Disk quota exceeded`.
+
 One-time setup, on a login node:
 
 ```
+PROJ=/projects/p31777
+export PIP_CACHE_DIR=$PROJ/.cache/pip  HF_HOME=$PROJ/.cache/huggingface  CONDA_PKGS_DIRS=$PROJ/.cache/conda_pkgs
 git clone git@github.com:duruoli/medical-llm-interpretability.git ~/AAA/medical-llm-interpretability
-conda create -n interp python=3.10 -y && conda activate interp
+conda create -p $PROJ/envs/interp python=3.10 -y && conda activate $PROJ/envs/interp
+pip install torch --index-url https://download.pytorch.org/whl/cu126   # CUDA 12 wheel; see note
 pip install -r requirements.txt
 huggingface-cli download Qwen/Qwen3.5-9B
 ```
+
+Note on torch: a plain `pip install torch` pulls the newest CUDA-13 wheel, which may be too new
+for the cluster's GPU driver. The `cu126` index gives a CUDA-12 build. If an existing env already
+works on the GPUs, match its CUDA version:
+`python -c "import torch; print(torch.__version__, torch.version.cuda)"`.
 
 Optional speed-up for the linear-attention layers (needs a CUDA build; skip it if it fails):
 
