@@ -70,7 +70,7 @@ def metric(logits_last, letter_ids, target_idx):
 
 @torch.no_grad()
 def score(lm, ids, letter_ids, target_idx):
-    with lm.trace(torch.tensor([ids])):
+    with lm.trace(torch.tensor([ids]), logits_to_keep=1):
         logits = lm.lm_head.output[:, -1, :].save()
     logits = logits[0].float()
     l4 = logits[letter_ids]
@@ -107,7 +107,7 @@ def segments(tok, text, result, p_ids, n_ids, offsets):
 @torch.no_grad()
 def cache_resid(lm, ids, n_layers):
     hs = []
-    with lm.trace(torch.tensor([ids])):
+    with lm.trace(torch.tensor([ids]), logits_to_keep=1):
         # explicit loop: nnsight cannot trace inside a list comprehension's own scope
         for l in range(n_layers):
             hs.append(lm.model.layers[l].output.save())
@@ -120,7 +120,7 @@ def patch_all_layers(lm, run_ids, src_cache, positions, n_layers, letter_ids, ta
     """Row l of the batch = run_ids with layer-l residual at `positions` taken from src."""
     batch = torch.tensor([run_ids] * n_layers)
     pos = torch.tensor(positions)
-    with lm.trace(batch):
+    with lm.trace(batch, logits_to_keep=1):   # logits for the last position only (memory)
         for l in range(n_layers):
             lm.model.layers[l].output[l, pos, :] = src_cache[l][pos, :]
         logits = lm.lm_head.output[:, -1, :].save()

@@ -10,12 +10,12 @@
 
 #SBATCH --account=p31777
 #SBATCH --partition=gengpu                          # ⚠️ CONFIRM this partition has the GPU below
-#SBATCH --gres=gpu:h100:1
+#SBATCH --gres=gpu:a100:1                          # 40 GB is enough (~20 GB peak); h100 also works
 #SBATCH --nodes=1
 #SBATCH --ntasks-per-node=1
 #SBATCH --cpus-per-task=8
 #SBATCH --mem=64G
-#SBATCH --time=02:00:00
+#SBATCH --time=04:00:00
 #SBATCH --job-name=patch_posneg
 #SBATCH --output=runs/patch_posneg_%j.out
 #SBATCH --error=runs/patch_posneg_%j.err

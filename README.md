@@ -81,7 +81,7 @@ Optional speed-up for the linear-attention layers (needs a CUDA build; skip it i
 pip install flash-linear-attention causal-conv1d
 ```
 
-Submit from the repo root. Needs 1 x H100 (or A100 80GB), 64G memory, under 2 h:
+Submit from the repo root. Needs 1 x A100 (40 GB is enough: logits are computed for the last position only), 64G memory, under 4 h:
 
 ```
 mkdir -p data runs && sbatch patch_posneg.slurm
