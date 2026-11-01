@@ -90,6 +90,23 @@ tail -f runs/patch_posneg_<jobid>.out
 
 Results land in `results/posneg/Qwen3.5-9B/`.
 
+## Follow-up: mechanism of the handoff (`mechanism_posneg.py`)
+
+Five hand-picked cases (clearest noise-vs-denoise asymmetry in the first run) x 3 forms.
+Three measurements in one run (~10 min on an A100; fine in an interactive session):
+
+- component patching at layers 4-12: resid / mixer (DeltaNet or attention) / MLP, at the
+  differing token and the words after it
+- attention weights to the differing token at every full-attention layer, in clean and
+  patched runs, to tell "the host run decides" from "the content decides"
+- distance between P and N residual streams per layer x segment ("is it there" vs "is it used")
+
+```
+python -u mechanism_posneg.py --model Qwen/Qwen3.5-9B
+```
+
+Results land in `results/mech/Qwen3.5-9B/`.
+
 ## Local smoke test
 
 Runs on CPU with a small model. Slow (about 14 min per case), so it is only for catching bugs:
