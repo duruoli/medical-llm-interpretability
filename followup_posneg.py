@@ -26,11 +26,28 @@ C. heads.jsonl - do specific attention heads carry the N information?
                                  If clamping removes most of the recovery, these heads carry
                                  the "no" information to the answer.
 
+D. cumulative.jsonl - how did the P/N difference get onto result_tail? A position's residual
+   after layer L = its own word embedding + every write into it by layers 0..L (each layer's
+   mixer and MLP). result_tail's words are identical in P and N, so its P/N difference after
+   layer L comes entirely from those writes. Here: replace, in one forward pass, ALL writes of
+   one component class into a position over layers 0..L (L in --cum-layers), both directions:
+     deltanet : linear-attention mixers (token mixing)
+     attn     : full-attention mixers (token mixing)
+     mlp      : MLPs (per-position processing)
+     all      : mixers + MLPs = every write
+     resid_all: the residual itself replaced at EVERY layer 0..L (reference). At result_tail
+                `all` must equal `resid_all` exactly (built-in check; at diff they differ by
+                the embedding). Note both differ from residual patching at layer L alone:
+                later tokens already read result_tail at layers < L, and here they read the
+                replaced version.
+   Which class gets close to `all` says whether the information was carried in by token
+   mixing or built in place by MLPs.
+
 Run (repo root):
   sbatch followup_posneg.slurm                                           # Quest
   python followup_posneg.py --model Qwen/Qwen3.5-0.8B --cases lipase__28842673 --forms negation \
       --heads neg:3.1,7.2 pos:3.4,7.5 --device cpu                       # local smoke test
-Output: results/followup/<model_tag>/{joint,lens,heads}.jsonl + run_config.json
+Output: results/followup/<model_tag>/{joint,lens,heads,cumulative}.jsonl + run_config.json
 """
 import argparse
 import json
@@ -41,7 +58,7 @@ import torch
 from nnsight import LanguageModel
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
-from mechanism_posneg import DEFAULT_CASES
+from mechanism_posneg import DEFAULT_CASES, comp_out
 from patch_posneg import FORMS, LETTERS, cache_resid, encode, metric, segments
 
 LENS_LAYERS = [4, 6, 8, 10, 12, 16, 20, 24, 28, 31]
@@ -101,6 +118,45 @@ def run_with(lm, ids, letter_ids, ti, hd, heads=(), head_src=None, positions=Non
     return metric(logits, letter_ids, ti).item()
 
 
+CUM_CLASSES = {"deltanet": (("mixer", "linear_attention"),),
+               "attn": (("mixer", "full_attention"),),
+               "mlp": (("mlp", None),),
+               "all": (("mixer", None), ("mlp", None)),
+               "resid_all": (("resid", None),)}
+
+
+@torch.no_grad()
+def cache_writes(lm, ids, layer_types, max_layer):
+    """Every mixer and MLP output (= the writes into the residual) and the residual itself,
+    layers 0..max_layer."""
+    out = {"mixer": {}, "mlp": {}, "resid": {}}
+    with lm.trace(torch.tensor([ids]), logits_to_keep=1):
+        for l in range(max_layer + 1):
+            out["mixer"][l] = comp_out(lm, layer_types, "mixer", l)[0].save()
+            out["mlp"][l] = lm.model.layers[l].mlp.output[0].save()
+            out["resid"][l] = lm.model.layers[l].output[0].save()
+    return out
+
+
+@torch.no_grad()
+def patch_cumulative(lm, layer_types, run_ids, src, positions, cls, cum_layers, letter_ids, ti):
+    """Batch row i = run_ids with every write of class `cls` into `positions` over layers
+    0..cum_layers[i] taken from src."""
+    batch = torch.tensor([run_ids] * len(cum_layers))
+    pos = torch.tensor(positions)
+    with lm.trace(batch, logits_to_keep=1):
+        for l in range(max(cum_layers) + 1):
+            rows = [i for i, L in enumerate(cum_layers) if l <= L]
+            for comp, ltype in CUM_CLASSES[cls]:
+                if ltype is not None and layer_types[l] != ltype:
+                    continue
+                o = comp_out(lm, layer_types, comp, l)
+                for i in rows:
+                    o[i, pos, :] = src[comp][l][pos, :]
+        logits = lm.lm_head.output[:, -1, :].save()
+    return metric(logits, letter_ids, ti).tolist()
+
+
 @torch.no_grad()
 def lens(hf, h):
     """Residual [..., hidden] -> vocabulary scores via the model's final norm + unembedding."""
@@ -117,6 +173,7 @@ def main():
     ap.add_argument("--max-layer", type=int, default=16)
     ap.add_argument("--heads", nargs="+", default=["neg:19.13,19.14,27.10", "pos:23.12,23.14,27.1"])
     ap.add_argument("--veto-layer", type=int, default=6)
+    ap.add_argument("--cum-layers", type=int, nargs="+", default=[3, 5, 6, 7, 8, 9, 10, 12])
     ap.add_argument("--device", default="auto")
     args = ap.parse_args()
 
@@ -147,6 +204,8 @@ def main():
     f_joint = (out / "joint.jsonl").open("w")
     f_lens = (out / "lens.jsonl").open("w")
     f_heads = (out / "heads.jsonl").open("w")
+    f_cum = (out / "cumulative.jsonl").open("w")
+    cum_layers = [l for l in args.cum_layers if l < n_layers]
     t0 = time.time()
     for cid in args.cases:
         c = pool[cid]
@@ -215,8 +274,24 @@ def main():
                 for cond, rec in res.items():
                     f_heads.write(json.dumps(dict(base_m, group=g, heads=[f"{l}.{h}" for l, h in hs],
                                                   condition=cond, recovery=rec)) + "\n")
+            # D. cumulative component patching
+            wp = cache_writes(lm, p_ids, layer_types, max(cum_layers))
+            wn = cache_writes(lm, n_ids, layer_types, max(cum_layers))
+            for pname in ["diff", "result_tail"]:
+                positions = pos_sets[pname]
+                if not positions:
+                    continue
+                for cls in CUM_CLASSES:
+                    for direction, run_ids, src in [("denoise", n_ids, wp), ("noise", p_ids, wn)]:
+                        ms = patch_cumulative(lm, layer_types, run_ids, src, positions, cls,
+                                              cum_layers, letter_ids, ti)
+                        for L, mp in zip(cum_layers, ms):
+                            rec = (mp - m_n) / gap if direction == "denoise" else (m_p - mp) / gap
+                            f_cum.write(json.dumps(dict(base_m, positions=pname, component=cls,
+                                                        direction=direction, up_to_layer=L,
+                                                        m_patched=mp, recovery=rec)) + "\n")
             print(f"  {cid} {form}  gap {gap:.2f}  ({time.time() - t0:.0f}s)", flush=True)
-    for f in (f_joint, f_lens, f_heads):
+    for f in (f_joint, f_lens, f_heads, f_cum):
         f.close()
     print(f"done -> {out}", flush=True)
 

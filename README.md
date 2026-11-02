@@ -131,6 +131,9 @@ Same five cases x 3 forms:
 - heads: swap or zero the heads that attend more to "no" (19.13, 19.14, 27.10) vs a control
   group preferring the positive word (23.12, 23.14, 27.1); and whether holding the "no" heads
   at their P values removes the effect of putting N's notes at the differing token
+- cumulative component patching: all DeltaNet / attention / MLP writes into a position over
+  layers 0..L at once (L = 3..12), against replacing the residual at every layer 0..L
+  (identical at result_tail by construction): was the information carried in or built in place?
 
 ```
 sbatch followup_posneg.slurm        # A100, 8 CPU, 64G, 1 h; results in results/followup/Qwen3.5-9B/

@@ -1,12 +1,12 @@
 #!/bin/bash
 
-# Follow-up: joint patching (diff + result_tail at once), logit lens, and head swap / ablation
-# for the "no"-preferring heads, 5 hand-picked cases x 3 forms, Qwen3.5-9B (see followup_posneg.py).
+# Follow-up: joint patching (diff + result_tail at once), logit lens, head swap / ablation,
+# cumulative component patching; 5 hand-picked cases x 3 forms, Qwen3.5-9B (see followup_posneg.py).
 # Submit from the repo root on Quest:  sbatch followup_posneg.slurm
 # Same env / caches as patch_posneg.slurm (README "Running on Quest").
 # Inputs:  data/posneg_pool.jsonl
 # Output:  results/followup/Qwen3.5-9B/   (scp back to the laptop)
-# Expected runtime ~10 min; wall time 1 h leaves headroom for model loading.
+# Expected runtime ~15-20 min; wall time 1 h leaves headroom for model loading.
 
 #SBATCH --account=p31777
 #SBATCH --partition=gengpu
