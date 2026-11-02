@@ -120,6 +120,22 @@ sbatch range_posneg.slurm
 
 Results land in `results/range/Qwen3.5-9B/` (`range_summary.md` = per-case tables).
 
+## Follow-up 2: joint patching, logit lens, heads (`followup_posneg.py`)
+
+Same five cases x 3 forms:
+
+- joint patching: residual at the differing token, at the words after it, and at both at once
+  (one intervention, not a sum), layers 0-16, both directions
+- logit lens: each position's residual at each layer read through the model's own final
+  norm + unembedding; which words N raises over P
+- heads: swap or zero the heads that attend more to "no" (19.13, 19.14, 27.10) vs a control
+  group preferring the positive word (23.12, 23.14, 27.1); and whether holding the "no" heads
+  at their P values removes the effect of putting N's notes at the differing token
+
+```
+sbatch followup_posneg.slurm        # A100, 8 CPU, 64G, 1 h; results in results/followup/Qwen3.5-9B/
+```
+
 ## Local smoke test
 
 Runs on CPU with a small model. Slow (about 14 min per case), so it is only for catching bugs:
