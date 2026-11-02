@@ -107,6 +107,19 @@ sbatch mechanism_posneg.slurm        # or, in an interactive session: python -u 
 
 Results land in `results/mech/Qwen3.5-9B/`.
 
+## Follow-up: does the model use the reference range? (`range_posneg.py`)
+
+Behavior only, all 40 pool cases. The numeric result keeps its value while the stated range
+changes ("9 mm (normal under 6 mm)" vs "9 mm (normal under 12 mm)" vs "9 mm", and the same
+for the low value). If the range is used, changing only the range moves the answer like
+changing the value does. About 5 min on an A100.
+
+```
+sbatch range_posneg.slurm
+```
+
+Results land in `results/range/Qwen3.5-9B/` (`range_summary.md` = per-case tables).
+
 ## Local smoke test
 
 Runs on CPU with a small model. Slow (about 14 min per case), so it is only for catching bugs:
