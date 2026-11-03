@@ -1,0 +1,12 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(python3 -c ' *)",
+      "Read(//Users/duruoli/A/A李杜若/1-科研/PhD/**)",
+      "Bash(/opt/anaconda3/envs/congraph/bin/python -c ' *)",
+      "Bash(/opt/anaconda3/envs/congraph/bin/python plot_posneg.py --run results/posneg/Qwen3.5-9B)",
+      "Bash(git commit -qam 'summary: describe asymmetry operationally; note host-vs-content ambiguity *)",
+      "Bash(git push *)"
+    ]
+  }
+}
