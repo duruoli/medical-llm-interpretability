@@ -3,5 +3,6 @@ data/
 # run outputs (contain model scores per MIMIC case) and slurm logs
 results/
 runs/
+materials/
 __pycache__/
 .DS_Store

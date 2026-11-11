@@ -23,15 +23,17 @@ Cells = test x form (12 in scope "all"; 4 per single form); a cell is its mean p
     delta        (diff segment only, kept next to AtP) |mean of the cells' mean z|: the neurons whose
                  activation differs most at the differing word, in scope all and per single form
 
-Guards: within each test, patients alternate into half A (select) and half B (never used to select);
+Guards: within each test, patients alternate into half A (rank) and half B (never used for ranking or
+for choosing the patched groups; only the candidates_* files filter on it afterwards);
 --holdout-tests go entirely to B. All wordings and forms of a patient stay in one half.
 null_p95: flip the sign per patient in half A, take the segment's top score, 95th percentile over
 flips. A sign flip tests "effect is symmetric around 0 across patients".
 
-Real patching check on half B, default light (--check-pairs random pairs; AtP top k combined, diff AtP
-and diff delta groups, their random controls, ceiling); --full-check = every group and pair.
-Both directions, one forward per row, no addition of effects: overwrite only the chosen neurons at
-the segment's positions with the other run's values.
+Real patching check on half B, default light (--check-pairs random pairs; AtP top k combined for BOTH
+rankings, diff AtP and diff delta groups, their random controls, ceiling); --full-check = every group
+and pair. Both directions, one forward per row, no addition of effects: overwrite only the chosen
+neurons at the segment's positions with the other run's values. This stage runs in float32, with its
+own clean m_P / m_N: in bf16 the same input's score moves with the batch size (up to 0.5).
     top k       top k sites (segment, layer, neuron) from half A, patched together
     random k    same segment and layer as the top k, random neuron index
     ceiling     every neuron at the segment's positions at every layer
@@ -40,10 +42,13 @@ Compares predicted and actual recovery.
 
 Output: results/neuron/<model_tag>/
     top_neurons.csv    per scope x segment x ranking
-    candidates.txt     ids: scope all, consistent, above null_p95, all half-B cells agree
+    candidates_consistent.txt  ids: scope all, consistent, above null_p95, all half-B cells agree
+    candidates_largest.txt     ids: scope all, largest, above null_p95, half-B mean has the same sign
     candidates_diff_delta.txt  ids: delta ranking at diff, per scope, above null_p95, half-B cells agree
+                       (none of these is the final list: choose after comparing overlap and patching)
     patch_check.jsonl  real patching (recovery, pred_recovery); patch_summary.csv means
-    summary.json       thresholds, |delta|-vs-atp overlap, faithfulness; pairs.jsonl; run_config.json
+    summary.json       thresholds, |delta|-vs-atp and consistent-vs-largest overlap, faithfulness;
+                       pairs.jsonl; run_config.json
     attr.npy (float16 [pair, segment, layer, neuron, denoise/noise]), deltas.npy, scales.npy
 
 Run (repo root):
@@ -154,13 +159,14 @@ def main():
     ap.add_argument("--pool", default="data/posneg_pool_v2.jsonl")
     ap.add_argument("--out-root", default="results/neuron")
     ap.add_argument("--patients-per-test", type=int, default=10)
-    ap.add_argument("--holdout-tests", nargs="*", default=["amylase", "us_appendix"])
-    ap.add_argument("--check-pairs", type=int, default=50, help="pairs in the light patching check")
+    ap.add_argument("--holdout-tests", nargs="*", default=["us_gallbladder", "hida"],
+                    help="default = both tests of one diagnosis; a test's sibling is nearly the same sentence")
+    ap.add_argument("--check-pairs", type=int, default=100, help="pairs in the light patching check")
     ap.add_argument("--full-check", action="store_true", help="every group on every half-B pair")
     ap.add_argument("--min-gap", type=float, default=1.0)
     ap.add_argument("--top", type=int, default=200, help="neurons listed per scope x segment x ranking")
     ap.add_argument("--n-flips", type=int, default=200)
-    ap.add_argument("--ks", type=int, nargs="+", default=[50])
+    ap.add_argument("--ks", type=int, nargs="+", default=[10, 50, 200])
     ap.add_argument("--single-top", type=int, default=0)
     ap.add_argument("--patch-batch", type=int, default=16)
     ap.add_argument("--seed", type=int, default=0)
@@ -353,17 +359,34 @@ def main():
     keep = list(dict.fromkeys(
         r["neuron"] for r in rows if r["scope"] == "all" and r["ranking"] == "consistent"
         and r["above_null_p95"] and r["cells_agree_B"] == r["n_cells_B"] and r["worst_cell_B"] > 0))
-    (out / "candidates.txt").write_text("".join(n + "\n" for n in keep))
+    (out / "candidates_consistent.txt").write_text("".join(n + "\n" for n in keep))
+    keep_largest = list(dict.fromkeys(
+        r["neuron"] for r in rows if r["scope"] == "all" and r["ranking"] == "largest"
+        and r["above_null_p95"] and r["mean_cell_B"] > 0))
+    (out / "candidates_largest.txt").write_text("".join(n + "\n" for n in keep_largest))
     keep_diff = list(dict.fromkeys(
         r["neuron"] for r in rows if r["ranking"] == "delta" and r["above_null_p95"]
         and r["cells_agree_B"] == r["n_cells_B"] and r["worst_cell_B"] > 0))
     (out / "candidates_diff_delta.txt").write_text("".join(n + "\n" for n in keep_diff))
-    print(f"ranking done ({time.time() - t0:.0f}s); {len(keep)} candidates", flush=True)
+    print(f"ranking done ({time.time() - t0:.0f}s); candidates: {len(keep)} consistent, "
+          f"{len(keep_largest)} largest", flush=True)
 
     # ---- stage 3: real patching on half B -------------------------------------------
     rng = np.random.default_rng(args.seed)
     combined = {r: sorted(((v, s, l, n) for (rk, s), xs in chosen.items() if rk == r for v, l, n in xs), reverse=True)
                 for r in RANKINGS}
+
+    # How much do the two rankings pick the same sites? (x[1:] = the site, without the score)
+    overlap = {}
+    for g in ["combined", *SEGMENTS]:
+        lists = {r: combined[r] if g == "combined" else chosen.get((r, g), []) for r in RANKINGS}
+        overlap[g] = {k: dict(n_consistent=len(lists["consistent"][:k]), n_largest=len(lists["largest"][:k]),
+                              shared=len({x[1:] for x in lists["consistent"][:k]} & {x[1:] for x in lists["largest"][:k]}))
+                      for k in args.ks}
+    summary["ranking_overlap"] = overlap
+    for k, v in overlap["combined"].items():
+        print(f"overlap top {k}: consistent {v['n_consistent']}, largest {v['n_largest']}, shared {v['shared']}", flush=True)
+
     plan = [dict(group="noop", ranking="", kind="noop", k=0, sites=[], full=None)]
     for r in RANKINGS:
         groups = {s: [(v, s, l, n) for v, l, n in xs] for (rk, s), xs in chosen.items() if rk == r}
@@ -394,9 +417,12 @@ def main():
     if not args.full_check:
         plan = [r for r in plan if r["kind"] == "noop" or (r["kind"] == "ceiling" and r["group"] == "combined")
                 or (r["kind"] in ("top", "random")
-                    and ((r["group"] == "combined" and r["ranking"] == "largest") or r["group"].startswith("diff:")))]
+                    and (r["group"] == "combined" or r["group"].startswith("diff:")))]
 
-    results, noop_err = [], 0.0
+    ra = z_a = ca = sa = sign = z_grand = flips = total = total2 = None      # free GPU memory before float32
+    torch.cuda.empty_cache() if device == "cuda" else None
+    hf.float()
+    results, noop_err, low_gap = [], 0.0, 0
     t1 = time.time()
     check = [i for i, p in enumerate(pairs) if p and p["half"] == "B" and gaps[i] >= args.min_gap]
     if not args.full_check and len(check) > args.check_pairs:
@@ -414,16 +440,21 @@ def main():
             seg = segments(tok, fm["P"], fm["P_result"], p_ids, n_ids, offs)
             handles = capture(blocks, clean_store, grad=False)
             with torch.no_grad():
-                hf(input_ids=torch.tensor([p_ids, n_ids], device=device), logits_to_keep=1, use_cache=False)
+                clean = hf(input_ids=torch.tensor([p_ids, n_ids], device=device), logits_to_keep=1,
+                           use_cache=False).logits[:, -1, :]
             for h in handles:
                 h.remove()
+            m_p, m_n = metric(clean, letter_ids, ti).tolist()              # float32 reference for this stage
+            gap = m_p - m_n
+            if gap < args.min_gap:
+                low_gap += 1
+                continue
             src = {"P": {l: v[0] for l, v in clean_store.items()}, "N": {l: v[1] for l, v in clean_store.items()}}
-            gap = p["m_P"] - p["m_N"]
             for di, direction in enumerate(DIRECTIONS):
                 host, other = (n_ids, "P") if direction == "denoise" else (p_ids, "N")
                 here = [row for row in plan if row.get("form") in (None, p["form"])]
                 ms = run_rows(hf, blocks, host, src[other], here, seg, args.patch_batch, letter_ids, ti, device)
-                base = p["m_N"] if direction == "denoise" else p["m_P"]
+                base = m_n if direction == "denoise" else m_p
                 noop_err = max(noop_err, abs(ms[0] - base) / max(1.0, abs(gap)))
                 for row, mp in zip(here, ms):
                     if row["kind"] == "noop":
@@ -434,7 +465,7 @@ def main():
                     else:
                         pred = sum(attr[pi, SEGMENTS.index(s), l, n, di].item() for s, l, n in row["sites"]
                                    if s in seg) / gap
-                    rec = (mp - p["m_N"]) / gap if direction == "denoise" else (p["m_P"] - mp) / gap
+                    rec = (mp - m_n) / gap if direction == "denoise" else (m_p - mp) / gap
                     record = dict(case_id=p["case_id"], test_id=p["test_id"], form=p["form"], direction=direction,
                                   group=row["group"], ranking=row["ranking"], kind=row["kind"], k=row["k"],
                                   gap=gap, recovery=rec, pred_recovery=pred)
@@ -455,9 +486,10 @@ def main():
 
     faith = {}
     for direction in DIRECTIONS:
-        for kinds, label in ((["single"], "single"), (["top"], "top_k")):
-            a = np.array([[r["pred_recovery"], r["recovery"]] for r in results
-                          if r["kind"] in kinds and r["direction"] == direction])
+        for kind, ranking, label in (("single", None, "single"), ("top", "consistent", "top_consistent"),
+                                     ("top", "largest", "top_largest"), ("top", "delta", "top_delta")):
+            a = np.array([[r["pred_recovery"], r["recovery"]] for r in results if r["kind"] == kind
+                          and r["direction"] == direction and ranking in (None, r["ranking"])])
             if len(a) > 2 and a.std(0).min() > 0:
                 faith[f"{label}/{direction}"] = {"n": len(a), "pearson": float(np.corrcoef(a.T)[0, 1]),
                                                  "mean_pred": float(a[:, 0].mean()), "mean_actual": float(a[:, 1].mean())}
@@ -465,9 +497,11 @@ def main():
     (out / "summary.json").write_text(json.dumps(summary, indent=2))
     (out / "run_config.json").write_text(json.dumps(
         dict(vars(args), device=device, dtype=str(dtype), n_layers=n_layers, n_neurons=n_neurons, segments=SEGMENTS,
-             max_pre_diff_leak=leak, max_noop_error=noop_err, skipped_pairs=skipped, n_cases=len(pool)), indent=2))
+             max_pre_diff_leak=leak, max_noop_error=noop_err, skipped_pairs=skipped, check_low_gap=low_gap,
+             n_cases=len(pool)), indent=2))
 
-    print(f"noop rows differ from clean by at most {noop_err:.4f} of the gap (should be ~0)")
+    print(f"noop rows differ from clean by at most {noop_err:.4f} of the gap (should be ~0); "
+          f"{low_gap} check pairs dropped (float32 gap < {args.min_gap})")
     for key, v in faith.items():
         print(f"AtP vs real patching {key:18s} n={v['n']:5d} r={v['pearson']:.2f} "
               f"mean pred {v['mean_pred']:.3f} actual {v['mean_actual']:.3f}")
