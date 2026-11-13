@@ -37,7 +37,7 @@ LIT = {  # test -> (sens, spec, spec_low) ; spec_low = lower CI bound, gives the
     "ct_sigmoid": (0.94, 0.99, 0.96),
     "ct_appendix": (0.95, 0.94, 0.94),
 }
-PAIRS = ["lexical", "impression", "full_impression", "findings"]
+PAIRS = ["lexical", "impression", "full_impression", "findings", "numeric"]  # numeric: appendix only
 FORMATS = ["mc4", "yesno"]
 
 
@@ -79,8 +79,10 @@ def summary(rows, pB_range):
              "up = m_P - m_B, down = m_B - m_N (log-odds; +2.3 = odds x10). "
              "ratio = mean(up)/mean(down), 95% bootstrap CI over cases. "
              f"Mid prior = baseline P(target) in {pB_range}. "
-             "n_wrong = cases where the negative result RAISED the target (down < 0).\n"]
+             "n_neg_raises = cases where the negative result RAISED the target (down < 0); "
+             "n_pos_lowers = cases where the positive result LOWERED it (up < 0).\n"]
     for test in LIT:
+        pairs = [p for p in PAIRS if p in rows[0][test]["mc4"]]
         up_lo, up_hi, down = lit_moves(test)
         lines.append(f"## {test}\n")
         lines.append(f"Literature ideal: up {up_lo:.1f}-{up_hi:.1f}, down {down:.1f}, "
@@ -92,16 +94,33 @@ def summary(rows, pB_range):
                       pB_range[0] <= r[test][fmt]["pB"] <= pB_range[1]]
                 if not rs:
                     continue
-                for pair in PAIRS:
+                for pair in pairs:
                     up = [r[test][fmt][pair]["up"] for r in rs]
                     dn = [r[test][fmt][pair]["down"] for r in rs]
                     mu, md = float(np.mean(up)), float(np.mean(dn))
                     lo, hi = ratio_ci(up, dn, rng)
                     tab.append([fmt, subset, len(rs), pair, round(mu, 2), round(md, 2),
                                 round(mu / md, 2) if md > 0 else "inf",
-                                f"{lo:.2f}-{hi:.2f}", sum(d < 0 for d in dn)])
+                                f"{lo:.2f}-{hi:.2f}", sum(d < 0 for d in dn), sum(u < 0 for u in up)])
         lines.append(tabulate(tab, headers=["format", "cases", "n", "pair", "up", "down", "ratio",
-                                            "ratio 95% CI", "n_wrong"], tablefmt="github"))
+                                            "ratio 95% CI", "n_neg_raises", "n_pos_lowers"],
+                              tablefmt="github"))
+        lines.append("")
+
+        # which cases go the wrong way (all cases; listed so they can be read one by one)
+        wrong = []
+        for fmt in FORMATS:
+            for pair in pairs:
+                for r in rows:
+                    d = r[test][fmt][pair]
+                    if d["down"] < 0 or d["up"] < 0:
+                        wrong.append([fmt, pair, r["hadm_id"], r["true_disease"],
+                                      round(r[test][fmt]["pB"], 2), round(d["up"], 2),
+                                      round(d["down"], 2)])
+        lines.append(f"### {test}: wrong-direction cases (all priors)\n")
+        lines.append(tabulate(wrong, headers=["format", "pair", "hadm_id", "true dz", "pB",
+                                              "up", "down"], tablefmt="github")
+                     if wrong else "none")
         lines.append("")
 
         # does the negative fail more for some true diseases? (mid prior, mc4 + yesno)
@@ -112,9 +131,9 @@ def summary(rows, pB_range):
                       and pB_range[0] <= r[test][fmt]["pB"] <= pB_range[1]]
                 if rs:
                     tab.append([fmt, dz, len(rs)] + [round(float(np.mean(
-                        [r[test][fmt][p]["down"] for r in rs])), 2) for p in PAIRS])
+                        [r[test][fmt][p]["down"] for r in rs])), 2) for p in pairs])
         lines.append(f"### {test}: mean down by true disease (mid prior)\n")
-        lines.append(tabulate(tab, headers=["format", "true dz", "n"] + PAIRS, tablefmt="github"))
+        lines.append(tabulate(tab, headers=["format", "true dz", "n"] + pairs, tablefmt="github"))
         lines.append("")
     return "\n".join(lines)
 

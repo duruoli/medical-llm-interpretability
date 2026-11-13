@@ -82,6 +82,10 @@ TESTS = {
                 "CT abdomen/pelvis: The appendix is dilated to 12 mm with wall thickening and "
                 "surrounding fat stranding.",
                 "CT abdomen/pelvis: The appendix is normal in caliber and appearance."),
+            # first run: "9 mm" sometimes LOWERED appendicitis. Real reports measure the
+            # appendix often (654/957), so keep it here; sigmoid has no real numeric form.
+            "numeric": ("CT abdomen/pelvis: appendix diameter 9 mm (normal under 6 mm).",
+                        "CT abdomen/pelvis: appendix diameter 4 mm (normal under 6 mm)."),
         },
     },
 }
