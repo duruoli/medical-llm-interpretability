@@ -7,6 +7,11 @@
       "Bash(/opt/anaconda3/envs/congraph/bin/python plot_posneg.py --run results/posneg/Qwen3.5-9B)",
       "Bash(git commit -qam 'summary: describe asymmetry operationally; note host-vs-content ambiguity *)",
       "Bash(git push *)"
+    ],
+    "deny": [
+      "Read(./data/harness_test/**)",
+      "Edit(./harness/**)",
+      "Write(./harness/**)"
     ]
   }
 }
