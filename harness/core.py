@@ -1,6 +1,17 @@
-"""Model wrapper, editing with rollback, scoring and guards. Shared by server.py and final_eval.py."""
+"""Model wrapper, editing with rollback, scoring and guards. Shared by server.py and final_eval.py.
+
+Diagnostic interventions (forward hooks, no weight change, removable) -- see Model.set_interventions:
+  add            h[pos] += alpha * v                        at a module output (default: residual after layer L)
+  project        h[pos] -= strength * ((h.v^) - center) v^  (remove / clamp a direction)
+  patch          h[pos] = same module, same position-from-end, in a SOURCE prompt run (per-prompt patch_from)
+  ablate_neurons MLP neurons of layer L scaled by (1 - scale) (input of down_proj)
+  ablate_heads   attention heads of a full-attention layer L scaled by (1 - scale) (input of o_proj)
+  freeze         listed modules output what they output on the ORIGINAL model (no weight edit, no
+                 interventions) for the same prompt -> tests self-repair / compensation.
+"""
 import json
 import math
+import re
 
 import numpy as np
 import torch
@@ -31,8 +42,166 @@ class Model:
         self.yn = self.tok.convert_tokens_to_ids(["Yes", "No"])
         self.params = dict(self.hf.named_parameters())
         self.orig = {}          # name -> CPU copy of the ORIGINAL weight (filled on first edit)
+        self.edited = {}        # name -> device copy of the EDITED weight (to swap back after a freeze run)
         self.active = []        # names currently carrying an edit
         self._ids = {}
+        # interventions
+        self.layers_prefix = next(n[:-2] for n, _ in self.hf.named_modules() if re.fullmatch(r".*\.layers\.0", n))
+        self.cfg = getattr(self.hf.config, "text_config", self.hf.config)
+        self.iv_specs, self.freeze_mods, self._iv_hooks = [], [], []
+        self._mode = "on"       # "on" | "capture_patch" | "capture_freeze"
+        self._patch_src, self._freeze_src = {}, {}
+
+    # ---- interventions -------------------------------------------------------------
+    def layer_module(self, layer, sub=""):
+        return f"{self.layers_prefix}.{layer}" + (f".{sub}" if sub else "")
+
+    def _vector(self, s):
+        v = s["vector"]
+        if isinstance(v, str):
+            obj = torch.load(v, map_location="cpu", weights_only=False)
+            v = obj[s["key"]] if isinstance(obj, dict) else obj
+        return torch.as_tensor(v, dtype=torch.float32).flatten().to(self.device)
+
+    @staticmethod
+    def _positions(pos, T):
+        if pos == "all":
+            return list(range(T))
+        if pos == "last":
+            return [T - 1]
+        return [p if p >= 0 else T + p for p in pos]
+
+    def _out_hook(self, k, s):
+        def hook(mod, args, out):
+            h = out[0] if isinstance(out, tuple) else out
+            if self._mode == "capture_patch":
+                if s["type"] == "patch":
+                    self._patch_src[k] = h[0].detach().clone()
+                return None
+            if self._mode != "on":
+                return None
+            h2 = h.clone()
+            T = h2.shape[1]
+            if s["type"] == "patch":
+                src = self._patch_src[k]
+                pos = s.get("positions", "last")
+                for p in ([-1] if pos == "last" else pos):
+                    h2[0, T + p] = src[src.shape[0] + p]
+            else:
+                idx = self._positions(s.get("positions", "last"), T)
+                x = h2[:, idx].float()
+                if s["type"] == "add":
+                    x = x + s["alpha"] * s["_v"]
+                else:  # project
+                    c = x @ s["_vhat"]
+                    x = x - s.get("strength", 1.0) * (c - s.get("center", 0.0))[..., None] * s["_vhat"]
+                h2[:, idx] = x.to(h2.dtype)
+            return (h2,) + tuple(out[1:]) if isinstance(out, tuple) else h2
+        return hook
+
+    def _ablate_hook(self, idx, scale):
+        def pre(mod, args):
+            if self._mode != "on":
+                return None
+            x = args[0].clone()
+            x[..., idx] = x[..., idx] * (1 - scale)
+            return (x,) + tuple(args[1:])
+        return pre
+
+    def _freeze_hook(self, name):
+        def hook(mod, args, out):
+            h = out[0] if isinstance(out, tuple) else out
+            if self._mode == "capture_freeze":
+                self._freeze_src[name] = h.detach().clone()
+                return None
+            if self._mode != "on":
+                return None
+            src = self._freeze_src[name]
+            return (src,) + tuple(out[1:]) if isinstance(out, tuple) else src
+        return hook
+
+    def clear_interventions(self):
+        for h in self._iv_hooks:
+            h.remove()
+        self.iv_specs, self.freeze_mods, self._iv_hooks = [], [], []
+        self._patch_src, self._freeze_src = {}, {}
+
+    def set_interventions(self, specs, freeze=()):
+        """Replace any active interventions. Returns one description line per spec."""
+        self.clear_interventions()
+        desc = []
+        try:
+            for k, s in enumerate(specs):
+                s, t = dict(s), s["type"]
+                if t in ("add", "project", "patch"):
+                    pos = s.get("positions", "last")
+                    if t == "patch" and pos != "last" and any(p >= 0 for p in pos):
+                        raise ValueError("patch positions must be 'last' or negative ints (counted from the end)")
+                    name = s.get("module") or self.layer_module(s["layer"])
+                    mod = self.hf.get_submodule(name)
+                    if t != "patch":
+                        s["_v"] = self._vector(s)
+                        s["_vhat"] = s["_v"] / s["_v"].norm().clamp_min(1e-12)
+                    self._iv_hooks.append(mod.register_forward_hook(self._out_hook(k, s)))
+                    extra = {"add": lambda: f"alpha={s['alpha']}, |v|={s['_v'].norm():.3g}",
+                             "project": lambda: f"strength={s.get('strength', 1.0)}, center={s.get('center', 0.0)}",
+                             "patch": lambda: "source = each prompt's patch_from"}[t]()
+                    desc.append(f"{t} @ {name} positions={pos} ({extra})")
+                elif t == "ablate_neurons":
+                    name = self.layer_module(s["layer"], "mlp.down_proj")
+                    mod = self.hf.get_submodule(name)
+                    self._iv_hooks.append(mod.register_forward_pre_hook(
+                        self._ablate_hook(list(s["neurons"]), s.get("scale", 1.0))))
+                    desc.append(f"ablate {len(s['neurons'])} MLP neurons of layer {s['layer']} x{s.get('scale', 1.0)}")
+                elif t == "ablate_heads":
+                    name = self.layer_module(s["layer"], "self_attn.o_proj")
+                    try:
+                        mod = self.hf.get_submodule(name)
+                    except AttributeError:
+                        raise ValueError(f"layer {s['layer']} has no self_attn.o_proj (not a full-attention layer)")
+                    hd = mod.in_features // self.cfg.num_attention_heads
+                    idx = [c for h in s["heads"] for c in range(h * hd, (h + 1) * hd)]
+                    self._iv_hooks.append(mod.register_forward_pre_hook(
+                        self._ablate_hook(idx, s.get("scale", 1.0))))
+                    desc.append(f"ablate heads {s['heads']} of layer {s['layer']} x{s.get('scale', 1.0)} (head_dim {hd})")
+                else:
+                    raise ValueError(f"unknown intervention type {t!r}")
+                self.iv_specs.append(s)
+            for name in freeze:
+                mod = self.hf.get_submodule(name)
+                self._iv_hooks.append(mod.register_forward_hook(self._freeze_hook(name)))
+                self.freeze_mods.append(name)
+                desc.append(f"freeze {name} (outputs its value on the original model, no edit, no interventions)")
+        except Exception:
+            self.clear_interventions()
+            raise
+        return desc
+
+    @torch.no_grad()
+    def _swap(self, to_original):
+        for n in self.active:
+            self.params[n].data.copy_((self.orig[n] if to_original else self.edited[n]).to(self.device))
+
+    @torch.no_grad()
+    def _forward(self, x, patch_ids=None, **kw):
+        """One forward pass with the active interventions (plus freeze / patch source runs)."""
+        try:
+            if any(s["type"] == "patch" for s in self.iv_specs):
+                if patch_ids is None:
+                    raise ValueError("a patch intervention is active: every prompt needs 'patch_from'")
+                self._mode = "capture_patch"
+                self.hf(torch.tensor([patch_ids], device=self.device), logits_to_keep=1)
+            if self.freeze_mods:
+                self._mode = "capture_freeze"
+                self._swap(True)
+                try:
+                    self.hf(x, **kw)
+                finally:
+                    self._swap(False)
+            self._mode = "on"
+            return self.hf(x, **kw)
+        finally:
+            self._mode = "on"
 
     # ---- forward passes ------------------------------------------------------------
     def ids(self, text, raw=False):
@@ -43,8 +212,9 @@ class Model:
         return self._ids[key]
 
     @torch.no_grad()
-    def yesno(self, ids):
-        lg = self.hf(torch.tensor([ids], device=self.device), logits_to_keep=1).logits[0, -1].float()
+    def yesno(self, ids, patch_ids=None):
+        x = torch.tensor([ids], device=self.device)
+        lg = self._forward(x, patch_ids, logits_to_keep=1).logits[0, -1].float()
         p = torch.softmax(lg, -1)
         y, n = self.yn
         return {"m": (lg[y] - lg[n]).item(), "mass": (p[y] + p[n]).item(), "logits": lg}
@@ -53,7 +223,9 @@ class Model:
     def nll(self, text):
         ids = self.tok(text, add_special_tokens=False).input_ids[:NLL_MAX_TOKENS]
         x = torch.tensor([ids], device=self.device)
-        lg = self.hf(x).logits[0, :-1].float()
+        if any(s["type"] == "patch" for s in self.iv_specs):
+            return float("nan")   # patching needs a per-prompt source; not defined for plain text
+        lg = self._forward(x).logits[0, :-1].float()
         return torch.nn.functional.cross_entropy(lg, x[0, 1:]).item()
 
     # ---- editing ---------------------------------------------------------------------
@@ -80,7 +252,7 @@ class Model:
     def reset(self):
         for n in self.active:
             self.params[n].data.copy_(self.orig[n].to(self.device))
-        self.active = []
+        self.active, self.edited = [], {}
 
     @torch.no_grad()
     def apply(self, deltas, scale=1.0):
@@ -94,6 +266,7 @@ class Model:
                 self.orig[n] = p.detach().to("cpu", copy=True)
             w0 = self.orig[n].to(self.device, torch.float32)
             p.data.copy_((w0 + scale * d.to(self.device, torch.float32)).to(p.dtype))
+            self.edited[n] = p.data.clone()
             self.active.append(n)
             eff += int((p.data != self.orig[n].to(self.device)).sum())
             rel.append((n, (scale * d.float()).norm().item() / max(w0.norm().item(), 1e-12)))

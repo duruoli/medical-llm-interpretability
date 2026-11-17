@@ -14,8 +14,13 @@ Endpoints (POST, JSON):
   logits  {prompts, top_k}    yes/no margin + top tokens per prompt              [probe_prompts]
   acts    {prompts, modules, positions, kind}  save activations to a .pt file    [probe_prompts]
   weights {names}             save ORIGINAL weights to a .pt file (free; analysis is CPU-side)
+  intervene {interventions, freeze}   install DIAGNOSTIC hooks (no weight change; free); they stay on for
+                              every later score / logits / acts call until `clear` or the next `intervene`
+  clear                       remove all interventions (free)
 A prompt is {"case": i, "test": t, "variant": "B"} or {..., "pair": p, "variant": "P"|"N"}
 (index into practice.jsonl) or {"text": "...", "raw": false} (chat template unless raw).
+With a `patch` intervention active, each prompt also needs "patch_from": <another prompt>.
+Intervention specs: see harness/core.py docstring and HANDOFF_round3.md.
 """
 import argparse
 import hashlib
@@ -47,6 +52,7 @@ class State:
         self.model = Model(args.model, args.device)
         self.items = load_items(args.practice, args.limit_cases)
         self.active = None
+        self.iv = None            # description of active interventions
         self.n_saved = len(list((self.out / "edits").glob("*.pt")))
         self.write_info(args.model)
         print(f"scoring original model on {len(self.items)} practice patients (free) ...", flush=True)
@@ -68,7 +74,7 @@ class State:
         (self.out / "model_info.json").write_text(json.dumps(info, indent=1, default=str))
 
     def log(self, rec):
-        rec = dict(rec, time=time.strftime("%Y-%m-%d %H:%M:%S"), edit=self.active)
+        rec = dict(rec, time=time.strftime("%Y-%m-%d %H:%M:%S"), edit=self.active, interventions=self.iv)
         with self.log_path.open("a") as f:
             f.write(json.dumps(rec, default=str) + "\n")
 
@@ -91,7 +97,7 @@ class State:
 
     # ---- commands ------------------------------------------------------------------------
     def cmd_status(self, req):
-        return {"budget_left": self.budget_left(), "active_edit": self.active,
+        return {"budget_left": self.budget_left(), "active_edit": self.active, "interventions": self.iv,
                 "practice_patients": len(self.items), "mid_cases": {k: len(v) for k, v in self.mid.items()}}
 
     def cmd_score(self, req):
@@ -101,11 +107,26 @@ class State:
         g = run_guards(self.model, self.items)
         rep, text = report(cur, self.ref, g, self.g_ref, self.items, self.mid)
         tag = f"{self.used['score_calls']:03d}"
-        (self.out / "scores" / f"{tag}.txt").write_text(f"edit: {self.active}\n\n{text}")
-        (self.out / "scores" / f"{tag}.json").write_text(json.dumps({"edit": self.active, **rep}))
+        (self.out / "scores" / f"{tag}.txt").write_text(
+            f"edit: {self.active}\ninterventions: {self.iv}\n\n{text}")
+        (self.out / "scores" / f"{tag}.json").write_text(
+            json.dumps({"edit": self.active, "interventions": self.iv, **rep}))
         self.log({"cmd": "score", "n": tag, "secs": round(time.time() - t0), "headline": rep["headline"]})
-        return {"text": f"[score {tag}, edit {self.active}, {time.time() - t0:.0f}s, "
+        return {"text": f"[score {tag}, edit {self.active}, interventions {self.iv}, {time.time() - t0:.0f}s, "
                         f"budget left {self.budget_left()}]\n{text}"}
+
+    def cmd_intervene(self, req):
+        desc = self.model.set_interventions(req.get("interventions", []), req.get("freeze", []))
+        self.iv = desc or None
+        self.log({"cmd": "intervene", "spec": req})
+        return {"text": "interventions active (diagnostic only, weights unchanged):\n" +
+                        "\n".join(f"  {d}" for d in desc)}
+
+    def cmd_clear(self, req):
+        self.model.clear_interventions()
+        self.iv = None
+        self.log({"cmd": "clear"})
+        return {"text": "all interventions removed"}
 
     def cmd_apply(self, req):
         src = Path(req["path"])
@@ -136,21 +157,25 @@ class State:
         prompts = req["prompts"]
         if len(prompts) > MAX_PROBE_PER_CALL:
             raise ValueError(f"at most {MAX_PROBE_PER_CALL} prompts per call")
-        self.spend("probe_prompts", len(prompts))
-        return prompts, [self.prompt_ids(p) for p in prompts]
+        ids = [self.prompt_ids(p) for p in prompts]
+        src = [self.prompt_ids(p["patch_from"]) if "patch_from" in p else None for p in prompts]
+        if any(s["type"] == "patch" for s in self.model.iv_specs) and None in src:
+            raise ValueError("a patch intervention is active: every prompt needs 'patch_from' (nothing charged)")
+        self.spend("probe_prompts", len(prompts) + sum(s is not None for s in src))
+        return prompts, list(zip(ids, src))
 
     def cmd_logits(self, req):
         prompts, ids = self._probe(req)
         k = int(req.get("top_k", 5))
         rows = []
-        for p, x in zip(prompts, ids):
-            r = self.model.yesno(x)
+        for p, (x, s) in zip(prompts, ids):
+            r = self.model.yesno(x, s)
             top = torch.topk(torch.softmax(r["logits"], -1), k)
             rows.append({"prompt": p, "yes_minus_no": round(r["m"], 3), "yesno_mass": round(r["mass"], 3),
                          "top": [(self.model.tok.decode([int(i)]), round(float(v), 3))
                                  for v, i in zip(top.values, top.indices)]})
         self.log({"cmd": "logits", "n": len(rows)})
-        return {"rows": rows, "budget_left": self.budget_left()}
+        return {"rows": rows, "interventions": self.iv, "budget_left": self.budget_left()}
 
     @torch.no_grad()
     def cmd_acts(self, req):
@@ -173,9 +198,9 @@ class State:
         acts = {m: [] for m in mods}
         margins, toks = [], []
         try:
-            for x in ids:
+            for x, s in ids:
                 cur.clear()
-                margins.append(self.model.yesno(x)["m"])
+                margins.append(self.model.yesno(x, s)["m"])
                 sel = (slice(None) if pos == "all" else [-1] if pos == "last" else list(pos))
                 for m in mods:
                     t = cur[m][0]
@@ -186,7 +211,7 @@ class State:
                 h.remove()
         path = self.out / "acts" / f"{time.strftime('%H%M%S')}_{len(list((self.out / 'acts').glob('*.pt'))):04d}.pt"
         torch.save({"acts": acts, "prompts": prompts, "tokens": toks, "yes_minus_no": margins,
-                    "kind": kind, "positions": pos, "edit": self.active}, path)
+                    "kind": kind, "positions": pos, "edit": self.active, "interventions": self.iv}, path)
         self.log({"cmd": "acts", "n": len(ids), "modules": mods, "file": str(path)})
         return {"text": f"saved {path} ({len(ids)} prompts x {len(mods)} modules); "
                         f"budget left {self.budget_left()}", "path": str(path)}

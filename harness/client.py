@@ -7,6 +7,8 @@
   python -m harness.client logits prompts.json [--top-k 5]
   python -m harness.client acts spec.json          # {"prompts": [...], "modules": [...], "positions": "last", "kind": "output"}
   python -m harness.client weights NAME [NAME ...]
+  python -m harness.client intervene spec.json     # {"interventions": [...], "freeze": [...]} (diagnostic hooks)
+  python -m harness.client clear                   # remove all interventions
 
 prompts.json = a JSON list of prompts, each {"case": i, "test": t, "variant": "B"},
 {"case": i, "test": t, "pair": p, "variant": "P"|"N"}, or {"text": "..."}.
@@ -35,7 +37,8 @@ def call(cmd, out=OUT, **req):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("cmd", choices=["status", "score", "apply", "reset", "logits", "acts", "weights"])
+    ap.add_argument("cmd", choices=["status", "score", "apply", "reset", "logits", "acts", "weights",
+                                    "intervene", "clear"])
     ap.add_argument("args", nargs="*")
     ap.add_argument("--scale", type=float, default=1.0)
     ap.add_argument("--note", default="")
@@ -47,7 +50,7 @@ def main():
         req = {"path": str(Path(a.args[0]).resolve()), "scale": a.scale, "note": a.note}
     elif a.cmd == "logits":
         req = {"prompts": json.loads(Path(a.args[0]).read_text()), "top_k": a.top_k}
-    elif a.cmd == "acts":
+    elif a.cmd in ("acts", "intervene"):
         req = json.loads(Path(a.args[0]).read_text())
     elif a.cmd == "weights":
         req = {"names": a.args}
