@@ -9,7 +9,8 @@ Talk to it with  python -m harness.client <command>  (see client.py / HANDOFF_we
 Endpoints (POST, JSON):
   status                      budget left, active edit
   score                       full practice evaluation of the current weights   [score_calls]
-  apply   {path, scale}       W = W_orig + scale*delta  (replaces any active edit; free)
+  apply   {path, scale, arm}  W = W_orig + scale*delta  (replaces any active edit; free); optional arm
+                              (config.ARMS) rejects parameters outside that arm
   reset                       back to original weights (free)
   logits  {prompts, top_k}    yes/no margin + top tokens per prompt              [probe_prompts]
   acts    {prompts, modules, positions, kind}  save activations to a .pt file    [probe_prompts]
@@ -132,17 +133,18 @@ class State:
         src = Path(req["path"])
         scale = float(req.get("scale", 1.0))
         deltas = load_edit(src)
-        stats = self.model.apply(deltas, scale)
+        arm = req.get("arm") or None
+        stats = self.model.apply(deltas, scale, arm)
         digest = hashlib.sha256(src.read_bytes()).hexdigest()[:10]
         self.n_saved += 1
         kept = self.out / "edits" / f"{self.n_saved:03d}_{src.stem}_{digest}.pt"
         shutil.copy(src, kept)
-        self.active = {"file": str(kept), "scale": scale, "nnz": stats["nnz"]}
-        self.log({"cmd": "apply", **stats, "note": req.get("note", "")})
+        self.active = {"file": str(kept), "scale": scale, "nnz": stats["nnz"], "arm": arm}
+        self.log({"cmd": "apply", **stats, "arm": arm, "note": req.get("note", "")})
         warn = ""
         if stats["effective_changed"] < 0.5 * stats["nnz"]:
             warn = " WARNING: most of the delta was lost to bf16 rounding; use a larger delta."
-        return {"text": f"applied {kept.name} x{scale}: {stats['nnz']:,} weights in delta, "
+        return {"text": f"applied {kept.name} x{scale} (arm {arm}): {stats['nnz']:,} weights in delta, "
                         f"{stats['effective_changed']:,} actually changed.{warn}\n"
                         "relative norm |delta|/|W| per parameter:\n" +
                         "\n".join(f"  {n}: {r:.4f}" for n, r in stats["relative_norm"])}

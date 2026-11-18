@@ -18,7 +18,7 @@ import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
 from harness.config import (DOWN_FLOOR, FORBIDDEN, GENERAL_SUFFIX, GENERAL_YESNO, MAX_NNZ,
-                            NLL_MAX_TOKENS, NLL_TEXTS, PB_RANGE, lit_moves)
+                            NLL_MAX_TOKENS, NLL_TEXTS, PB_RANGE, arm_check, lit_moves)
 
 
 def chat(tok, text):
@@ -232,13 +232,14 @@ class Model:
     def original(self, name):
         return self.orig[name] if name in self.orig else self.params[name].detach().cpu()
 
-    def validate(self, deltas):
+    def validate(self, deltas, arm=None):
         nnz = 0
         for n, d in deltas.items():
             if n not in self.params:
                 raise ValueError(f"unknown parameter {n!r} (see model_info.json for names)")
             if FORBIDDEN.search(n):
                 raise ValueError(f"parameter {n!r} is off limits (embedding / lm_head / final norm / vision)")
+            arm_check(n, arm)
             if tuple(d.shape) != tuple(self.params[n].shape):
                 raise ValueError(f"{n}: delta shape {tuple(d.shape)} != weight {tuple(self.params[n].shape)}")
             if not torch.isfinite(d).all():
@@ -255,9 +256,9 @@ class Model:
         self.active, self.edited = [], {}
 
     @torch.no_grad()
-    def apply(self, deltas, scale=1.0):
+    def apply(self, deltas, scale=1.0, arm=None):
         """Replace any current edit by W = W_orig + scale * delta. Returns stats."""
-        nnz = self.validate(deltas)
+        nnz = self.validate(deltas, arm)
         self.reset()
         eff, rel = 0, []
         for n, d in deltas.items():
@@ -350,7 +351,12 @@ def report(cur, ref, g_cur, g_ref, items, mid, worst=8):
     mass = float(np.mean([cur[i][t]["mass_B"] for i in range(len(items)) for t in items[i]["tests"]]))
     gold = [a for _, a in GENERAL_YESNO]
     acc = lambda ms: float(np.mean([(mm > 0) == (a == "Yes") for mm, a in zip(ms, gold)]))
+    by_test = lambda cs: {t: float(np.mean([abs(c["asym"]) for k, c in cs.items() if k.split("/")[0] == t]))
+                          for t in dict.fromkeys(k.split("/")[0] for k in cs)}
     head = {
+        "abs_asym": float(np.mean([abs(c["asym"]) for c in c_now.values()])),
+        "abs_asym_orig": float(np.mean([abs(c["asym"]) for c in c_ref.values()])),
+        "abs_asym_by_test": by_test(c_now), "abs_asym_by_test_orig": by_test(c_ref),
         "asym_mean": float(np.mean([c["asym"] for c in c_now.values()])),
         "asym_mean_orig": float(np.mean([c["asym"] for c in c_ref.values()])),
         "move_err": float(np.mean([abs(c["up"] - c["lit_up"]) + abs(c["down"] - c["lit_down"])
@@ -378,6 +384,10 @@ def report(cur, ref, g_cur, g_ref, items, mid, worst=8):
     fails.sort(key=lambda x: x["down"])
 
     L = ["HEADLINE (now vs original)",
+         f"  abs_asym       {head['abs_asym']:.3f}  (orig {head['abs_asym_orig']:.3f}; mean over cells of |asym|: "
+         "over- AND under-correction both count)",
+         "  abs_asym by test: " + "  ".join(f"{t} {head['abs_asym_by_test_orig'][t]:.2f}->{v:.2f}"
+                                           for t, v in head["abs_asym_by_test"].items()),
          f"  asym_mean      {head['asym_mean']:+.3f}  (orig {head['asym_mean_orig']:+.3f}; 0 = literature ratio, >0 = positive bias)",
          f"  move_err       {head['move_err']:.3f}  (orig {head['move_err_orig']:.3f}; |up-lit|+|down-lit|)",
          f"  neg_raises     {head['neg_raises']}  (orig {head['neg_raises_orig']}; negative result RAISED belief)",

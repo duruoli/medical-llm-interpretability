@@ -2,7 +2,7 @@
 
   python -m harness.client status
   python -m harness.client score
-  python -m harness.client apply /scratch/dlf8982/harness/work/my_edit.pt [--scale 0.5] [--note "..."]
+  python -m harness.client apply /scratch/dlf8982/harness/work/my_edit.pt [--scale 0.5] [--arm B_translate] [--note "..."]
   python -m harness.client reset
   python -m harness.client logits prompts.json [--top-k 5]
   python -m harness.client acts spec.json          # {"prompts": [...], "modules": [...], "positions": "last", "kind": "output"}
@@ -42,12 +42,13 @@ def main():
     ap.add_argument("args", nargs="*")
     ap.add_argument("--scale", type=float, default=1.0)
     ap.add_argument("--note", default="")
+    ap.add_argument("--arm", default="", help="edit arm (config.ARMS); the server rejects parameters outside it")
     ap.add_argument("--top-k", type=int, default=5)
     ap.add_argument("--out", default=str(OUT), help="harness output dir (holds server.json)")
     a = ap.parse_args()
 
     if a.cmd == "apply":
-        req = {"path": str(Path(a.args[0]).resolve()), "scale": a.scale, "note": a.note}
+        req = {"path": str(Path(a.args[0]).resolve()), "scale": a.scale, "note": a.note, "arm": a.arm}
     elif a.cmd == "logits":
         req = {"prompts": json.loads(Path(a.args[0]).read_text()), "top_k": a.top_k}
     elif a.cmd in ("acts", "intervene"):
