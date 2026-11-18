@@ -126,6 +126,32 @@ Other explanations not yet excluded:
 **Consequence for the arms.** If the hypothesis holds, arms A and B are not expected to fix this cell, because
 the fault is before the translators. Say so, and check in step 4 whether arm C found something earlier.
 
+### Update after Step 0 (human, 11-17): how to aim the arms
+Step 0 is done; see `/scratch/dlf8982/harness_r5/work/STEP0.md`. It changes the aiming:
+
+- **Arm B: aim at the route the lab negative already uses, not at 27.11/27.13.** The Yes-only translators barely
+  sign-flip even for the lab negative (18% of its extra No, mostly the L28 mixer). The existing No route runs
+  through:
+  - H27.12, 15%;
+  - H23.5, about 10%;
+  - the L28 mixer;
+  - MLPs L23–28, about 40%. Arm B cannot reach these.
+
+  So arm B's natural edit makes **H27.12, H23.5 and the L28 mixer respond to CT negatives the way they already
+  respond to lab negatives**. That means changing what they read, not scaling their output. Scaling their output
+  would also push lipase further, and lipase is already over-moved: `down` 2.7 vs lit 1.39.
+- **Arm C: the first thing to try is the same route including the MLPs.** That is attention, mixers and MLPs in
+  L23–29, which no other arm covers. The rest of C stays free. Say which you did.
+- **`ct_sigmoid/findings` is a linking failure, not a translation failure.** Naming the pouches fixes it (0.01 →
+  0.86), and making the appendix indirect weakens the appendix (0.74 → 0.50). The failing sentences are short at
+  L19 and never align with the readout. Do not spend arm A or B budget on this cell. If arm C has budget left, an
+  attempt at L12–20 is welcome but optional.
+- **A caveat on the 0a contrast.** CT negatives for pancreatitis move the wrong way (+0.21) even when they name the
+  disease. In real medicine a normal CT does not rule out mild pancreatitis, and lipase is the diagnostic test. So
+  part of that contrast may be the model's medical knowledge, not a flaw. The practice score uses only the
+  sigmoid and appendix CTs and lipase, so this does not affect scoring. But do not use CT-for-pancreatitis as a
+  repair target.
+
 ## Steps 1–3: one best edit per arm (about 20–22 score calls each)
 Suggested order: **B first** (the main hypothesis), then **A** (the baseline), then **C**.
 
