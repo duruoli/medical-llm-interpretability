@@ -24,6 +24,7 @@ import argparse
 import json
 import math
 import random
+import re
 import time
 from pathlib import Path
 
@@ -126,7 +127,25 @@ class Runner:
 
 
 # ---- data ------------------------------------------------------------------------------------
-def build_items(pool_path, limit):
+# Question wordings. "orig" is the one every earlier result (Qwen page, harness) uses. The others test
+# whether a model reads "Does this patient have X?" as "is X already established?" (-> No while the
+# result is pending) rather than "how likely is X?".
+QUESTIONS = {
+    "orig":   "Does this patient have {d}?",
+    "likely": "Is {d} a likely diagnosis for this patient?",
+    "could":  "Could this patient have {d}?",
+}
+Q_RE = re.compile(r"Does this patient have (.*)\?(\n\nAnswer Yes or No only\.)$", re.S)
+
+
+def reword(text, q):
+    m = Q_RE.search(text)
+    if not m:
+        raise ValueError("prompt does not end with the standard question")
+    return text[:m.start()] + QUESTIONS[q].format(d=m.group(1)) + m.group(2)
+
+
+def build_items(pool_path, limit, question="orig"):
     suite = SUITES["repair"]
     pool = [json.loads(l) for l in open(pool_path)]
     # same patient split as harness/make_splits.py (seed 0) -> mark the 94-patient test half
@@ -135,10 +154,18 @@ def build_items(pool_path, limit):
         cs = [c for c in pool if c["true_disease"] == dz]
         rng.shuffle(cs)
         test_ids |= {c["hadm_id"] for c in cs[len(cs) // 2:]}
+    if limit:   # stratified subset: round-robin over true diseases, so AUCs are defined
+        by = {dz: [c for c in pool if c["true_disease"] == dz] for dz in sorted({c["true_disease"] for c in pool})}
+        pool = [by[dz][k] for k in range(max(map(len, by.values()))) for dz in by if k < len(by[dz])][:limit]
     items = [item_from_pool(c, suite, True) for c in pool]
     for it in items:
         it["split"] = "test" if it["hadm_id"] in test_ids else "practice"
-    return items[:limit] if limit else items
+        if question != "orig":
+            for t in it["tests"].values():
+                t["B"] = reword(t["B"], question)
+                for pr in t["pairs"].values():
+                    pr["P"], pr["N"] = reword(pr["P"], question), reword(pr["N"], question)
+    return items
 
 
 def flatten(items):
@@ -221,16 +248,22 @@ def per_test(rows, items, idx, pb=PB_RANGE, n_boot=1000, seed=0):
 
 
 def history_check(rows, items, pb_range=PB_RANGE):
+    """No-result belief: spread, ranking (AUC for the true disease) and LEVEL (calibration vs true diagnoses).
+    Level reference = share of pool patients with that diagnosis (the pool is enriched: every patient has
+    one of four diseases, so a model calibrated to real ED prevalence should sit BELOW it, but not far below)."""
     out = {}
     for test in items[0]["tests"]:
         b = np.array([r[test]["B"] for r in rows])
         pb = 1 / (1 + np.exp(-b))
         dz = TEST_DISEASE[test]
-        a = (auc([b[i] for i, it in enumerate(items) if it["true_disease"] == dz],
-                 [b[i] for i, it in enumerate(items) if it["true_disease"] != dz]) if dz else float("nan"))
+        y = np.array([it["true_disease"] == dz for it in items])
+        a = auc(list(b[y]), list(b[~y])) if dz else float("nan")
         out[test] = {"pB_median": float(np.median(pb)), "pB_iqr": [float(np.percentile(pb, 25)), float(np.percentile(pb, 75))],
                      "m_sd": float(b.std()), "frac_mid": float(np.mean((pb >= pb_range[0]) & (pb <= pb_range[1]))),
-                     "auc_true_disease": a}
+                     "auc_true_disease": a, "pB_mean": float(pb.mean()),
+                     "prevalence_pool": float(y.mean()) if dz else float("nan"),
+                     "pB_median_true": float(np.median(pb[y])) if dz and y.any() else float("nan"),
+                     "pB_median_other": float(np.median(pb[~y])) if dz and (~y).any() else float("nan")}
     return out
 
 
@@ -401,13 +434,17 @@ def main():
                     help="no GPU: re-analyse <out>/margins.jsonl (e.g. after copying it back)")
     ap.add_argument("--pb-range", type=float, nargs=2, default=list(PB_RANGE),
                     help=f"mid-prior range (default {PB_RANGE}); a non-default value writes REPORT_pb<lo>-<hi>.md")
+    ap.add_argument("--question", default="orig", choices=list(QUESTIONS),
+                    help="question wording (orig = all earlier results); "
+                    + "; ".join(f"{k}: {v}" for k, v in QUESTIONS.items()))
     args = ap.parse_args()
-    out = Path(args.out or f"results/diagnose/{args.model.split('/')[-1]}")
+    out = Path(args.out or f"results/diagnose/{args.model.split('/')[-1]}"
+               + ("" if args.question == "orig" else f"/q_{args.question}"))
     out.mkdir(parents=True, exist_ok=True)
     pb = tuple(args.pb_range)
     suffix = "" if pb == tuple(PB_RANGE) else f"_pb{pb[0]:g}-{pb[1]:g}"
 
-    items = build_items(args.pool, args.limit_cases)
+    items = build_items(args.pool, args.limit_cases, args.question)
     rows, sanity = load_margins(out, items) if args.from_margins else run_model(args, items, out)
     tc, gen_acc = sanity["token_check"], sanity["general_acc"]
 
@@ -423,7 +460,7 @@ def main():
     abs_asym = float(np.mean([abs(c["asym"]) for c in cells_all.values()])) if cells_all else float("nan")
 
     checks, decision = gate(tc, mass_B, gen_acc, hist, pt_all)
-    L = [f"# Stage 1 diagnose: {args.model}", "",
+    L = [f"# Stage 1 diagnose: {args.model}  (question: {QUESTIONS[args.question]})", "",
          f"{len(items)} patients ({len(test_idx)} in the harness test half). Mid prior = no-result P(Yes) in {pb}"
          f"{'' if not suffix else ' (NON-DEFAULT; default ' + str(PB_RANGE) + ')'}. "
          "asym = ln(up/down) − ln(ideal up/ideal down); > 0 = positives over-weighted relative to negatives. "
@@ -442,12 +479,16 @@ def main():
          "## 1 Does it read the history? (no-result prompt)", "",
          "AUC = how well the no-result belief separates patients whose true diagnosis is the asked disease "
          "(0.5 = ignores history).", "",
-         "| test | median P(Yes) | IQR | sd of log-odds | fraction mid-prior | AUC true disease |", "|---|---|---|---|---|---|"]
+         "Level: mean P(Yes) vs the share of pool patients who truly have the disease (enriched pool, so a model "
+         "calibrated to real ED prevalence should be somewhat below it, not orders of magnitude below).", "",
+         "| test | median P(Yes) | IQR | sd of log-odds | fraction mid-prior | AUC true disease | "
+         "mean P(Yes) / pool prevalence | median P(Yes) true cases / others |", "|---|---|---|---|---|---|---|---|"]
     for test in IMAGING + LAB:
         h = hist.get(test)
         if h:
             L.append(f"| {test} | {h['pB_median']:.3f} | {h['pB_iqr'][0]:.3f}–{h['pB_iqr'][1]:.3f} | {h['m_sd']:.2f} | "
-                     f"{h['frac_mid']:.2f} | {h['auc_true_disease']:.2f} |")
+                     f"{h['frac_mid']:.2f} | {h['auc_true_disease']:.2f} | {h['pB_mean']:.3f} / {h['prevalence_pool']:.3f} | "
+                     f"{h['pB_median_true']:.4f} / {h['pB_median_other']:.4f} |")
     L += [""] + fmt_bands(pbands)
     L += ["## 2 Per test (mid-prior cases)", "",
           "up/ideal and down/ideal: model's mean move ÷ literature move (1 = exact). "
