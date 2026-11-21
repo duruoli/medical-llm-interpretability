@@ -82,3 +82,10 @@ and every version is reported.
 
 - 2026-11-21: framework fixed; stage 1 implemented (`harness/diagnose.py`). It matches `core.Model.yesno`
   exactly on Qwen3.5-0.8B; left-padded batching changes margins by ≤ 0.0006 (gemma-3-1b, CPU).
+- 2026-11-21: stage 1 additions after MedGemma-1.5-4B (median no-result P(Yes) 0.1–0.5%, only 4–17
+  mid-prior cases per test):
+  (a) §1b prior-band check on all patients, to test whether a low prior compresses the moves. On MedGemma it does:
+      the down move rises with the prior, rank correlation +0.81 to +0.94, while the up move does not. So the 0.02 lower bound stays,
+      and low-prior cases may NOT be pooled.
+  (b) a `source` column (neg under-used / pos over-used) plus a GATE note, because the repair direction depends on it;
+  (c) `--from-margins` re-analysis without a GPU and `--pb-range` (non-default ranges are written to separate files).

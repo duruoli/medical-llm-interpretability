@@ -31,7 +31,7 @@ import numpy as np
 import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
-from harness.config import GENERAL_SUFFIX, GENERAL_YESNO, LIT, PB_RANGE, SUITES, lit_moves
+from harness.config import DOWN_FLOOR, GENERAL_SUFFIX, GENERAL_YESNO, LIT, PB_RANGE, SUITES, lit_moves
 from harness.core import cell_stats
 from harness.make_splits import item_from_pool
 
@@ -59,8 +59,9 @@ class Runner:
         if not self.tok.chat_template:             # multimodal checkpoints keep the template on the processor
             from transformers import AutoProcessor
             self.proc = AutoProcessor.from_pretrained(name)
-        cuda = device.startswith("cuda")
-        # on GPU load straight into GPU memory (needs accelerate) so a 27B model never sits in CPU RAM
+        cuda = device.startswith("cuda") or device == "auto"
+        # on GPU load straight into GPU memory (needs accelerate) so a 27B model never sits in CPU RAM;
+        # device "auto" splits the layers over all visible GPUs (e.g. 27B on 2x A100 40GB)
         kw = {"dtype": torch.bfloat16 if cuda else torch.float32, **({"device_map": device} if cuda else {})}
         try:
             self.hf = AutoModelForCausalLM.from_pretrained(name, **kw)
@@ -169,14 +170,25 @@ def auc(pos, neg):
     return float(np.mean([(a > b) + 0.5 * (a == b) for a in pos for b in neg]))
 
 
-def mid_idx(rows, idx, test):
-    return [i for i in idx if PB_RANGE[0] <= 1 / (1 + math.exp(-rows[i][test]["B"])) <= PB_RANGE[1]]
+def mid_idx(rows, idx, test, pb=PB_RANGE):
+    return [i for i in idx if pb[0] <= 1 / (1 + math.exp(-rows[i][test]["B"])) <= pb[1]]
 
 
-def per_test(rows, items, idx, n_boot=1000, seed=0):
+def source(up_r, down_r):
+    """Where the imbalance comes from, from move / ideal ratios (1 = literature)."""
+    if down_r < 0.8 and up_r <= 1.5:
+        return "neg under-used"
+    if up_r > 1.5 and down_r >= 0.8:
+        return "pos over-used"
+    if up_r > 1.5 and down_r < 0.8:
+        return "both"
+    return "near ideal"
+
+
+def per_test(rows, items, idx, pb=PB_RANGE, n_boot=1000, seed=0):
     sub_items = [items[i] for i in idx]
     sub_rows = [rows[i] for i in idx]
-    mid = {t: mid_idx(sub_rows, range(len(sub_rows)), t) for t in sub_items[0]["tests"]}
+    mid = {t: mid_idx(sub_rows, range(len(sub_rows)), t, pb) for t in sub_items[0]["tests"]}
     cells = cell_stats(sub_rows, sub_items, mid)
     rng = np.random.default_rng(seed)
     out = {}
@@ -204,10 +216,11 @@ def per_test(rows, items, idx, n_boot=1000, seed=0):
             "neg_raises": sum(c["neg_raises"] for c in cs.values()),
             "neg_pairs": sum(c["n"] for c in cs.values()),
         }
+        out[test]["source"] = source(out[test]["up_over_ideal"], out[test]["down_over_ideal"])
     return out, cells
 
 
-def history_check(rows, items):
+def history_check(rows, items, pb_range=PB_RANGE):
     out = {}
     for test in items[0]["tests"]:
         b = np.array([r[test]["B"] for r in rows])
@@ -216,24 +229,72 @@ def history_check(rows, items):
         a = (auc([b[i] for i, it in enumerate(items) if it["true_disease"] == dz],
                  [b[i] for i, it in enumerate(items) if it["true_disease"] != dz]) if dz else float("nan"))
         out[test] = {"pB_median": float(np.median(pb)), "pB_iqr": [float(np.percentile(pb, 25)), float(np.percentile(pb, 75))],
-                     "m_sd": float(b.std()), "frac_mid": float(np.mean((pb >= PB_RANGE[0]) & (pb <= PB_RANGE[1]))),
+                     "m_sd": float(b.std()), "frac_mid": float(np.mean((pb >= pb_range[0]) & (pb <= pb_range[1]))),
                      "auc_true_disease": a}
     return out
 
 
+def prior_bands(rows, items, n_bands=4):
+    """Saturation check on ALL cases: split by no-result belief (quantiles); per band the mean move up / down
+    (case moves averaged over wordings) and the band's asym. If the lowest band is not compressed (moves and
+    asym similar to the higher bands), a low prior does not distort this model and a wider range is safe."""
+    out = {}
+    for test in items[0]["tests"]:
+        lu, ld = lit_moves(test)
+        pairs = list(items[0]["tests"][test]["pairs"])
+        B = np.array([r[test]["B"] for r in rows])
+        up = np.array([np.mean([r[test][p]["P"] - r[test]["B"] for p in pairs]) for r in rows])
+        dn = np.array([np.mean([r[test]["B"] - r[test][p]["N"] for p in pairs]) for r in rows])
+        raise_ = np.array([np.mean([r[test]["B"] - r[test][p]["N"] < 0 for p in pairs]) for r in rows])
+        edges = np.quantile(B, np.linspace(0, 1, n_bands + 1))
+        band = np.clip(np.searchsorted(edges, B, side="right") - 1, 0, n_bands - 1)
+        bands = []
+        for k in range(n_bands):
+            s = band == k
+            mu, md = float(up[s].mean()), float(dn[s].mean())
+            bands.append({"n": int(s.sum()), "pB_median": float(np.median(1 / (1 + np.exp(-B[s])))),
+                          "up": mu, "down": md, "up_over_ideal": mu / lu, "down_over_ideal": md / ld,
+                          "asym": math.log(max(mu, DOWN_FLOOR) / max(md, DOWN_FLOOR)) - math.log(lu / ld),
+                          "neg_raises_frac": float(raise_[s].mean())})
+        # correlation of each case's move with its prior (Spearman via ranks)
+        rk = lambda x: np.argsort(np.argsort(x))
+        out[test] = {"bands": bands,
+                     "rho_up_prior": float(np.corrcoef(rk(B), rk(up))[0, 1]),
+                     "rho_down_prior": float(np.corrcoef(rk(B), rk(dn))[0, 1])}
+    return out
+
+
+def fmt_bands(pbands):
+    L = ["## 1b Does a low starting belief compress the moves? (all patients, quartiles of no-result belief)", "",
+         "Each test: four bands from lowest to highest no-result P(Yes). up/ideal, down/ideal and asym per band. "
+         "If the lowest band looks like the others, low priors are not saturated on this model and the mid-prior "
+         "range can be widened (record it in PIPELINE.md change log). rho = rank correlation of a case's move "
+         "with its prior.", "",
+         "| test | band | n | median P(Yes) | up/ideal | down/ideal | asym | neg raised |", "|---|---|---|---|---|---|---|---|"]
+    for test in IMAGING + LAB:
+        if test not in pbands:
+            continue
+        for k, b in enumerate(pbands[test]["bands"]):
+            L.append(f"| {test if k == 0 else ''} | {k + 1} | {b['n']} | {b['pB_median']:.4f} | {b['up_over_ideal']:.2f} | "
+                     f"{b['down_over_ideal']:.2f} | {b['asym']:+.2f} | {b['neg_raises_frac']:.2f} |")
+        L.append(f"| | rho | | | {pbands[test]['rho_up_prior']:+.2f} | {pbands[test]['rho_down_prior']:+.2f} | | |")
+    return L + [""]
+
+
 def fmt_test_table(pt, title):
     L = [f"### {title}", "",
-         "| test | sens/spec | n mid | asym mean [95% CI] | asym range | up/ideal | down/ideal | wordings asym>0 | negative raised belief |",
-         "|---|---|---|---|---|---|---|---|---|"]
+         "| test | sens/spec | n mid | asym mean [95% CI] | asym range | up/ideal | down/ideal | source | wordings asym>0 | negative raised belief |",
+         "|---|---|---|---|---|---|---|---|---|---|"]
     for test in IMAGING + LAB:
         r = pt.get(test)
         if not r or not r["n_mid"]:
-            L.append(f"| {test} | | 0 | – | | | | | |")
+            L.append(f"| {test} | | 0 | – | | | | | | |")
             continue
         s, sp = LIT[test]
         L.append(f"| {test} | {s:.2f}/{sp:.2f} | {r['n_mid']}/{r['n_total']} | {r['asym_mean']:+.2f} "
                  f"[{r['asym_ci'][0]:+.2f}, {r['asym_ci'][1]:+.2f}] | {r['asym_min']:+.2f} … {r['asym_max']:+.2f} | "
-                 f"{r['up_over_ideal']:.2f} | {r['down_over_ideal']:.2f} | {r['wordings_pos']}/{r['n_wordings']} | "
+                 f"{r['up_over_ideal']:.2f} | {r['down_over_ideal']:.2f} | {r['source']} | "
+                 f"{r['wordings_pos']}/{r['n_wordings']} | "
                  f"{r['neg_raises']}/{r['neg_pairs']} |")
     im = [pt[t] for t in IMAGING if pt.get(t, {}).get("n_mid")]
     lb = [pt[t] for t in LAB if pt.get(t, {}).get("n_mid")]
@@ -275,7 +336,56 @@ def gate(tc, mass_B, gen_acc, hist, pt):
         dec = f"NO BIAS: only {im_pos}/{len(im)} imaging tests CI > 0; report as a negative result, no repair"
     checks["bias: imaging tests with CI > 0"] = f"{im_pos}/{len(im)}"
     checks["lab mean asym"] = round(lab_mean, 3)
+    srcs = [pt[t]["source"] for t in IMAGING if pt.get(t, {}).get("n_mid")]
+    checks["imbalance source (imaging)"] = ", ".join(f"{s} {srcs.count(s)}" for s in dict.fromkeys(srcs))
+    if im and srcs.count("pos over-used") > len(srcs) / 2:
+        dec += (" | NOTE: imbalance comes mainly from OVER-USED POSITIVES, not under-used negatives; "
+                "a 'push imaging negatives to No' repair would fix asym but overshoot the negative moves")
     return checks, dec
+
+
+def run_model(args, items, out):
+    """GPU part: score every prompt, write margins.jsonl. Returns rows + sanity info."""
+    t0 = time.time()
+    keys, texts = flatten(items)
+    print(f"{len(items)} patients, {len(texts)} prompts; loading {args.model}", flush=True)
+    R = Runner(args.model, args.device, args.batch)
+    tc = R.token_check()
+    print(f"loaded ({time.time() - t0:.0f}s); Yes/No tokens {tc}", flush=True)
+    first_B = [k for k, key in enumerate(keys) if key[2] == "B"][:3]
+    res = R.margins(texts, topk_for=set(first_B))
+    print(f"scored ({time.time() - t0:.0f}s)", flush=True)
+    gen = R.margins([q + GENERAL_SUFFIX for q, _ in GENERAL_YESNO], topk_for={0, 3})
+    rows = unflatten(items, keys, res)
+    with (out / "margins.jsonl").open("w") as f:
+        for it, r in zip(items, rows):
+            f.write(json.dumps({"hadm_id": it["hadm_id"], "true_disease": it["true_disease"],
+                                "split": it["split"], "tests": r}) + "\n")
+    gold = [a for _, a in GENERAL_YESNO]
+    sanity = {
+        "token_check": tc,
+        "general_acc": float(np.mean([(g["m"] > 0) == (a == "Yes") for g, a in zip(gen, gold)])),
+        "mass_all_mean": float(np.mean([r["mass"] for r in res])), "mass_all_min": float(np.min([r["mass"] for r in res])),
+        "model_class": type(R.hf).__name__, "n_layers": getattr(R.cfg, "num_hidden_layers", None),
+        "softcap": getattr(R.cfg, "final_logit_softcapping", None),
+        "top5_B": [res[k].get("top5") for k in first_B], "top5_general": [gen[k].get("top5") for k in (0, 3)],
+        "n_prompts": len(texts), "batch": args.batch, "seconds": round(time.time() - t0),
+    }
+    (out / "sanity.json").write_text(json.dumps(sanity, indent=1))
+    return rows, sanity
+
+
+def load_margins(out, items):
+    """Re-analysis without a GPU: rows from margins.jsonl, sanity from sanity.json (or an older report.json)."""
+    by_id = {json.loads(l)["hadm_id"]: json.loads(l) for l in open(out / "margins.jsonl")}
+    rows = [by_id[it["hadm_id"]]["tests"] for it in items if it["hadm_id"] in by_id]
+    items[:] = [it for it in items if it["hadm_id"] in by_id]
+    if (out / "sanity.json").exists():
+        sanity = json.loads((out / "sanity.json").read_text())
+    else:   # first MedGemma run predates sanity.json
+        old = json.loads((out / "report.json").read_text())
+        sanity = {"token_check": old["token_check"], "general_acc": old["general_acc"]}
+    return rows, sanity
 
 
 def main():
@@ -285,57 +395,50 @@ def main():
     ap.add_argument("--out", default=None, help="default results/diagnose/<model name>")
     ap.add_argument("--batch", type=int, default=8, help="1 = no padding (exact); >1 = left-padded batches")
     ap.add_argument("--limit-cases", type=int, default=0, help="smoke test on the first N patients")
-    ap.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
+    ap.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu",
+                    help="cuda (one GPU), auto (split over all visible GPUs), or cpu")
+    ap.add_argument("--from-margins", action="store_true",
+                    help="no GPU: re-analyse <out>/margins.jsonl (e.g. after copying it back)")
+    ap.add_argument("--pb-range", type=float, nargs=2, default=list(PB_RANGE),
+                    help=f"mid-prior range (default {PB_RANGE}); a non-default value writes REPORT_pb<lo>-<hi>.md")
     args = ap.parse_args()
     out = Path(args.out or f"results/diagnose/{args.model.split('/')[-1]}")
     out.mkdir(parents=True, exist_ok=True)
+    pb = tuple(args.pb_range)
+    suffix = "" if pb == tuple(PB_RANGE) else f"_pb{pb[0]:g}-{pb[1]:g}"
 
-    t0 = time.time()
     items = build_items(args.pool, args.limit_cases)
-    keys, texts = flatten(items)
-    print(f"{len(items)} patients, {len(texts)} prompts; loading {args.model}", flush=True)
-    R = Runner(args.model, args.device, args.batch)
-    tc = R.token_check()
-    print(f"loaded ({time.time() - t0:.0f}s); Yes/No tokens {tc}", flush=True)
-
-    first_B = [k for k, key in enumerate(keys) if key[2] == "B"][:3]
-    res = R.margins(texts, topk_for=set(first_B))
-    print(f"scored ({time.time() - t0:.0f}s)", flush=True)
-    gen = R.margins([q + GENERAL_SUFFIX for q, _ in GENERAL_YESNO], topk_for={0, 3})
-    rows = unflatten(items, keys, res)
-
-    with (out / "margins.jsonl").open("w") as f:
-        for it, r in zip(items, rows):
-            f.write(json.dumps({"hadm_id": it["hadm_id"], "true_disease": it["true_disease"],
-                                "split": it["split"], "tests": r}) + "\n")
+    rows, sanity = load_margins(out, items) if args.from_margins else run_model(args, items, out)
+    tc, gen_acc = sanity["token_check"], sanity["general_acc"]
 
     # ---- analysis
     all_idx = list(range(len(items)))
     test_idx = [i for i, it in enumerate(items) if it["split"] == "test"]
-    pt_all, cells_all = per_test(rows, items, all_idx)
-    pt_test, _ = per_test(rows, items, test_idx) if test_idx else ({}, {})
-    hist = history_check(rows, items)
+    pt_all, cells_all = per_test(rows, items, all_idx, pb)
+    pt_test, _ = per_test(rows, items, test_idx, pb) if test_idx else ({}, {})
+    hist = history_check(rows, items, pb)
+    pbands = prior_bands(rows, items)
     gold = [a for _, a in GENERAL_YESNO]
-    gen_acc = float(np.mean([(g["m"] > 0) == (a == "Yes") for g, a in zip(gen, gold)]))
-    mass_B = [r["mass"] for k, r in zip(keys, res) if k[2] == "B"]
-    mass_all = [r["mass"] for r in res]
+    mass_B = [r[t]["mass_B"] for r in rows for t in r]
     abs_asym = float(np.mean([abs(c["asym"]) for c in cells_all.values()])) if cells_all else float("nan")
 
     checks, decision = gate(tc, mass_B, gen_acc, hist, pt_all)
     L = [f"# Stage 1 diagnose: {args.model}", "",
-         f"{len(items)} patients ({len(test_idx)} in the harness test half), {len(texts)} prompts, batch {args.batch}, "
-         f"{time.time() - t0:.0f}s. Mid prior = no-result P(Yes) in {PB_RANGE}. "
-         "asym = ln(up/down) − ln(ideal up/ideal down); > 0 = positives over-weighted relative to negatives.", "",
+         f"{len(items)} patients ({len(test_idx)} in the harness test half). Mid prior = no-result P(Yes) in {pb}"
+         f"{'' if not suffix else ' (NON-DEFAULT; default ' + str(PB_RANGE) + ')'}. "
+         "asym = ln(up/down) − ln(ideal up/ideal down); > 0 = positives over-weighted relative to negatives. "
+         "source: neg under-used = down/ideal < 0.8; pos over-used = up/ideal > 1.5 with down/ideal ≥ 0.8.", "",
          "## GATE", "", f"**{decision}**", ""] + [f"- {k}: {v}" for k, v in checks.items()] + ["",
          "## 0 Sanity", "",
-         f"- model: {type(R.hf).__name__}, {getattr(R.cfg, 'num_hidden_layers', '?')} layers, "
-         f"final_logit_softcapping={getattr(R.cfg, 'final_logit_softcapping', None)}",
+         f"- model: {sanity.get('model_class', '?')}, {sanity.get('n_layers', '?')} layers, "
+         f"final_logit_softcapping={sanity.get('softcap')}",
          f"- Yes/No tokens: {json.dumps(tc)}",
          f"- P(Yes)+P(No) at answer: no-result prompts mean {np.mean(mass_B):.3f} (min {np.min(mass_B):.3f}); "
-         f"all prompts mean {np.mean(mass_all):.3f} (min {np.min(mass_all):.3f}). If low, m is not the model's real answer.",
+         f"all prompts mean {sanity.get('mass_all_mean', float('nan')):.3f} (min {sanity.get('mass_all_min', float('nan')):.3f}). "
+         "If low, m is not the model's real answer.",
          f"- general yes/no accuracy: {gen_acc:.3f} ({len(gold)} questions)",
-         "- top-5 next tokens, first no-result prompts: " + "; ".join(str(res[k].get("top5")) for k in first_B),
-         "- top-5 next tokens, general Q 0 and 3: " + "; ".join(str(gen[k].get("top5")) for k in (0, 3)), "",
+         f"- top-5 next tokens, first no-result prompts: {sanity.get('top5_B', 'n/a')}",
+         f"- top-5 next tokens, general Q 0 and 3: {sanity.get('top5_general', 'n/a')}", "",
          "## 1 Does it read the history? (no-result prompt)", "",
          "AUC = how well the no-result belief separates patients whose true diagnosis is the asked disease "
          "(0.5 = ignores history).", "",
@@ -345,7 +448,8 @@ def main():
         if h:
             L.append(f"| {test} | {h['pB_median']:.3f} | {h['pB_iqr'][0]:.3f}–{h['pB_iqr'][1]:.3f} | {h['m_sd']:.2f} | "
                      f"{h['frac_mid']:.2f} | {h['auc_true_disease']:.2f} |")
-    L += ["", "## 2 Per test", "",
+    L += [""] + fmt_bands(pbands)
+    L += ["## 2 Per test (mid-prior cases)", "",
           "up/ideal and down/ideal: model's mean move ÷ literature move (1 = exact). "
           "'negative raised belief' = mid-prior (case, wording) pairs where the negative moved belief toward Yes.", ""]
     L += fmt_test_table(pt_all, f"All {len(items)} patients")
@@ -357,12 +461,13 @@ def main():
     for k, c in cells_all.items():
         L.append(f"| {k} | {c['n']} | {c['up']:.2f} | {c['down']:.2f} | {c['lit_up']:.2f}/{c['lit_down']:.2f} | "
                  f"{c['asym']:+.2f} | {c['neg_raises']} |")
-    (out / "REPORT.md").write_text("\n".join(L) + "\n")
-    (out / "report.json").write_text(json.dumps(
-        {"model": args.model, "token_check": tc, "mass_B_mean": float(np.mean(mass_B)), "general_acc": gen_acc,
-         "history": hist, "per_test_all": pt_all, "per_test_testhalf": pt_test, "cells_all": cells_all,
+    (out / f"REPORT{suffix}.md").write_text("\n".join(L) + "\n")
+    (out / f"report{suffix}.json").write_text(json.dumps(
+        {"model": args.model, "pb_range": pb, "token_check": tc, "mass_B_mean": float(np.mean(mass_B)),
+         "general_acc": gen_acc, "history": hist, "prior_bands": pbands, "per_test_all": pt_all,
+         "per_test_testhalf": pt_test, "cells_all": cells_all,
          "abs_asym_all": abs_asym, "gate": {"checks": checks, "decision": decision}}, indent=1, default=str))
-    print(f"GATE: {decision}\n-> {out / 'REPORT.md'} ({time.time() - t0:.0f}s)", flush=True)
+    print(f"GATE: {decision}\n-> {out / f'REPORT{suffix}.md'}", flush=True)
 
 
 if __name__ == "__main__":
