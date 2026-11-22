@@ -107,3 +107,8 @@ and every version is reported.
   and Qwen's "negatives under-used" holds at its typical priors (2-10%), not at 30-70%. Stage-1 headline =
   §1c (slope over bins + imaging−lab gap in matched bins). Repair target to be decided.
   Note: with a non-orig `--question`, `--out` gets `q_<question>` appended, so pass the model directory.
+- 2026-11-22: `--edit FILE [--scale s] [--control]` in stage 1: scores an edited model and compares it with the unedited
+  run of the same model and wording (must exist in `<out>[/q_<question>]`). Output `<…>/edit_<stem>_x<s>[_control]/`, new §1d.
+  Mid-prior cases and prior bins are chosen by the ORIGINAL model's belief, so selection does not move with the edit.
+  First use: Qwen round-6 C3 under `--question could`. Question: is C3 a constant extra push on imaging negatives
+  (high-prior bins overshoot), and does it stay imaging-selective when the prior distribution moves?

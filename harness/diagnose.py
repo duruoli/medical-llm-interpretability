@@ -202,6 +202,7 @@ def auc(pos, neg):
 
 
 def mid_idx(rows, idx, test, pb=PB_RANGE):
+    """rows decide the prior: pass the ORIGINAL model's rows when scoring an edit (selection must not move)."""
     return [i for i in idx if pb[0] <= 1 / (1 + math.exp(-rows[i][test]["B"])) <= pb[1]]
 
 
@@ -216,10 +217,11 @@ def source(up_r, down_r):
     return "near ideal"
 
 
-def per_test(rows, items, idx, pb=PB_RANGE, n_boot=1000, seed=0):
+def per_test(rows, items, idx, pb=PB_RANGE, n_boot=1000, seed=0, sel_rows=None):
     sub_items = [items[i] for i in idx]
     sub_rows = [rows[i] for i in idx]
-    mid = {t: mid_idx(sub_rows, range(len(sub_rows)), t, pb) for t in sub_items[0]["tests"]}
+    sub_sel = [(sel_rows or rows)[i] for i in idx]
+    mid = {t: mid_idx(sub_sel, range(len(sub_rows)), t, pb) for t in sub_items[0]["tests"]}
     cells = cell_stats(sub_rows, sub_items, mid)
     rng = np.random.default_rng(seed)
     out = {}
@@ -308,29 +310,73 @@ FAMILIES = {"CT diverticulitis": ["ct_sigmoid"], "appendicitis (CT+US)": ["ct_ap
             "lab (lipase+amylase)": ["lipase", "amylase"]}
 
 
-def prior_bins(rows, min_n=15):
+def prior_bins(rows, min_n=15, sel_rows=None, ref_rows=None):
     """asym in FIXED prior bins, all cases (no mid-prior filter). Each case: move up / down averaged over
     wordings, divided by its own test's ideal move; asym = ln(mean up ratio / mean down ratio).
     Main stage-1 result since 2026-11-21: asym depends strongly on where the prior sits, so models and
-    wordings are only comparable bin by bin; the imaging-minus-lab gap within a bin is prior-matched."""
+    wordings are only comparable bin by bin; the imaging-minus-lab gap within a bin is prior-matched.
+    sel_rows: rows whose no-result belief assigns the bin (the ORIGINAL model when scoring an edit).
+    ref_rows: also report the mean no-result drift (B - B_ref, log-odds) per bin."""
+    sel_rows = sel_rows or rows
     out = {}
     for fam, tests in FAMILIES.items():
         row = []
         for lo, hi in zip(PRIOR_BINS[:-1], PRIOR_BINS[1:]):
-            ups, dns = [], []
+            ups, dns, drift = [], [], []
             for t in tests:
                 lu, ld = lit_moves(t)
-                for r in rows:
-                    if lo <= 1 / (1 + math.exp(-r[t]["B"])) < hi:
+                for k, r in enumerate(rows):
+                    if lo <= 1 / (1 + math.exp(-sel_rows[k][t]["B"])) < hi:
                         ps = [p for p in r[t] if isinstance(r[t][p], dict)]
                         ups.append(np.mean([r[t][p]["P"] - r[t]["B"] for p in ps]) / lu)
                         dns.append(np.mean([r[t]["B"] - r[t][p]["N"] for p in ps]) / ld)
+                        if ref_rows:
+                            drift.append(r[t]["B"] - ref_rows[k][t]["B"])
             ok = len(ups) >= min_n
             row.append({"n": len(ups), "asym": math.log(max(np.mean(ups), 0.03) / max(np.mean(dns), 0.03)) if ok else None,
                         "up_over_ideal": float(np.mean(ups)) if ok else None,
-                        "down_over_ideal": float(np.mean(dns)) if ok else None})
+                        "down_over_ideal": float(np.mean(dns)) if ok else None,
+                        **({"drift": float(np.mean(drift)) if ok else None} if ref_rows else {})})
         out[fam] = row
     return out
+
+
+def edit_compare(rows, ref_rows, items, idx):
+    """Edit vs original in the SAME prior bins (assigned by the original model). Answers: is the edit a
+    constant extra push on imaging negatives (down rises by the same amount in every bin, high bins overshoot),
+    or does it shrink where the original was already balanced? And does the lab row stay put?"""
+    r_e, r_o = [rows[i] for i in idx], [ref_rows[i] for i in idx]
+    return {"orig": prior_bins(r_o), "edit": prior_bins(r_e, sel_rows=r_o, ref_rows=r_o)}
+
+
+def fmt_edit_compare(cmp, title):
+    L = [f"### {title}", "",
+         "Per bin: asym orig → edit; Δdown and Δup = change of (move ÷ ideal move); drift = mean change of the "
+         "no-result log-odds. Bins are assigned by the ORIGINAL model's no-result belief.", "",
+         "| family | " + " | ".join(PRIOR_BIN_LABELS) + " |", "|---|" + "---|" * len(PRIOR_BIN_LABELS)]
+    for fam in FAMILIES:
+        cells = []
+        for o, e in zip(cmp["orig"][fam], cmp["edit"][fam]):
+            if o["asym"] is None:
+                cells.append("–")
+                continue
+            cells.append(f"{o['asym']:+.2f}→{e['asym']:+.2f}<br>Δdn {e['down_over_ideal'] - o['down_over_ideal']:+.2f} "
+                         f"Δup {e['up_over_ideal'] - o['up_over_ideal']:+.2f}<br>drift {e['drift']:+.2f} (n {o['n']})")
+        L.append(f"| {fam} | " + " | ".join(cells) + " |")
+    lab_o, lab_e = cmp["orig"]["lab (lipase+amylase)"], cmp["edit"]["lab (lipase+amylase)"]
+    gaps = {"orig": [], "edit": []}
+    for fam in FAMILIES:
+        if fam.startswith("lab"):
+            continue
+        for k in range(len(PRIOR_BIN_LABELS)):
+            for which, lab in (("orig", lab_o), ("edit", lab_e)):
+                c = cmp[which][fam][k]
+                if c["asym"] is not None and lab[k]["asym"] is not None:
+                    gaps[which].append(c["asym"] - lab[k]["asym"])
+    if gaps["orig"]:
+        L += ["", f"- imaging minus lab, same bin: {np.mean(gaps['orig']):+.2f} → {np.mean(gaps['edit']):+.2f} "
+                  f"({len(gaps['orig'])} (family, bin) pairs)"]
+    return L + [""]
 
 
 def fmt_bins(pbins):
@@ -430,6 +476,31 @@ def gate(tc, mass_B, gen_acc, hist, pt):
     return checks, dec
 
 
+@torch.no_grad()
+def apply_edit(hf, args):
+    """W = W_orig + scale * delta (same rule as core.Model.apply). --control: random content, same support/norm."""
+    from harness.core import load_edit, random_control
+    deltas = load_edit(args.edit)
+    if args.control:
+        deltas = random_control(deltas)
+    params = dict(hf.named_parameters())
+    missing = [n for n in deltas if n not in params]
+    if missing:
+        raise SystemExit(f"edit parameters not in model {args.model}: {missing[:5]} (edit made for another model?)")
+    nnz, rel = 0, []
+    for n, d in deltas.items():
+        p = params[n]
+        w0 = p.detach().float()
+        dd = args.scale * d.to(p.device, torch.float32)
+        p.data.copy_((w0 + dd).to(p.dtype))
+        nnz += int((d != 0).sum())
+        rel.append(float(dd.norm() / w0.norm().clamp_min(1e-12)))
+    info = {"file": str(args.edit), "scale": args.scale, "control": args.control, "n_params": len(deltas),
+            "nnz": nnz, "max_relative_norm": max(rel)}
+    print(f"edit applied: {info}", flush=True)
+    return info
+
+
 def run_model(args, items, out):
     """GPU part: score every prompt, write margins.jsonl. Returns rows + sanity info."""
     t0 = time.time()
@@ -438,6 +509,7 @@ def run_model(args, items, out):
     R = Runner(args.model, args.device, args.batch)
     tc = R.token_check()
     print(f"loaded ({time.time() - t0:.0f}s); Yes/No tokens {tc}", flush=True)
+    edit_info = apply_edit(R.hf, args) if args.edit else None
     first_B = [k for k, key in enumerate(keys) if key[2] == "B"][:3]
     res = R.margins(texts, topk_for=set(first_B))
     print(f"scored ({time.time() - t0:.0f}s)", flush=True)
@@ -456,6 +528,7 @@ def run_model(args, items, out):
         "softcap": getattr(R.cfg, "final_logit_softcapping", None),
         "top5_B": [res[k].get("top5") for k in first_B], "top5_general": [gen[k].get("top5") for k in (0, 3)],
         "n_prompts": len(texts), "batch": args.batch, "seconds": round(time.time() - t0),
+        "edit": edit_info,
     }
     (out / "sanity.json").write_text(json.dumps(sanity, indent=1))
     return rows, sanity
@@ -490,11 +563,22 @@ def main():
     ap.add_argument("--question", default="orig", choices=list(QUESTIONS),
                     help="question wording (orig = all earlier results); "
                     + "; ".join(f"{k}: {v}" for k, v in QUESTIONS.items()))
+    ap.add_argument("--edit", default=None,
+                    help="weight edit (.pt, {param: delta}) applied before scoring; results go to <out>/edit_<stem>_x<scale>/ "
+                         "and are compared bin by bin with the unedited run in <out> (run that first, same --question)")
+    ap.add_argument("--scale", type=float, default=1.0)
+    ap.add_argument("--control", action="store_true", help="with --edit: random control (same support and norm)")
     args = ap.parse_args()
     # non-orig wordings ALWAYS go to a q_<name>/ subdir (also with --out), so they never overwrite orig results
     out = Path(args.out or f"results/diagnose/{args.model.split('/')[-1]}")
     if args.question != "orig":
         out = out / f"q_{args.question}"
+    ref_dir = None
+    if args.edit:       # the unedited run of the same model + wording is the reference
+        ref_dir = out
+        if not (ref_dir / "margins.jsonl").exists():
+            raise SystemExit(f"--edit needs the unedited run first: {ref_dir / 'margins.jsonl'} not found")
+        out = out / f"edit_{Path(args.edit).stem}_x{args.scale:g}{'_control' if args.control else ''}"
     out.mkdir(parents=True, exist_ok=True)
     pb = tuple(args.pb_range)
     suffix = "" if pb == tuple(PB_RANGE) else f"_pb{pb[0]:g}-{pb[1]:g}"
@@ -502,15 +586,23 @@ def main():
     items = build_items(args.pool, args.limit_cases, args.question)
     rows, sanity = load_margins(out, items) if args.from_margins else run_model(args, items, out)
     tc, gen_acc = sanity["token_check"], sanity["general_acc"]
+    ref_rows = None
+    if ref_dir:
+        by_id = {json.loads(l)["hadm_id"]: json.loads(l)["tests"] for l in open(ref_dir / "margins.jsonl")}
+        ref_rows = [by_id[it["hadm_id"]] for it in items]
 
-    # ---- analysis
+    # ---- analysis (with an edit: mid-prior cases and bins are chosen by the ORIGINAL model's belief)
     all_idx = list(range(len(items)))
     test_idx = [i for i, it in enumerate(items) if it["split"] == "test"]
-    pt_all, cells_all = per_test(rows, items, all_idx, pb)
-    pt_test, _ = per_test(rows, items, test_idx, pb) if test_idx else ({}, {})
+    pt_all, cells_all = per_test(rows, items, all_idx, pb, sel_rows=ref_rows)
+    pt_test, _ = per_test(rows, items, test_idx, pb, sel_rows=ref_rows) if test_idx else ({}, {})
     hist = history_check(rows, items, pb)
     pbands = prior_bands(rows, items)
-    pbins = prior_bins(rows)
+    pbins = prior_bins(rows, sel_rows=ref_rows, ref_rows=ref_rows)
+    ecmp = None
+    if ref_rows:
+        ecmp = {"all": edit_compare(rows, ref_rows, items, all_idx),
+                "test_half": edit_compare(rows, ref_rows, items, test_idx) if test_idx else None}
     gold = [a for _, a in GENERAL_YESNO]
     mass_B = [r[t]["mass_B"] for r in rows for t in r]
     abs_asym = float(np.mean([abs(c["asym"]) for c in cells_all.values()])) if cells_all else float("nan")
@@ -546,6 +638,16 @@ def main():
                      f"{h['frac_mid']:.2f} | {h['auc_true_disease']:.2f} | {h['pB_mean']:.3f} / {h['prevalence_pool']:.3f} | "
                      f"{h['pB_median_true']:.4f} / {h['pB_median_other']:.4f} |")
     L += [""] + fmt_bands(pbands) + fmt_bins(pbins)
+    if ecmp:
+        ei = sanity.get("edit") or {}
+        L += [f"## 1d Edit vs original, same prior bins ({ei.get('file', args.edit)} x{args.scale:g}"
+              f"{', RANDOM CONTROL' if args.control else ''}; reference {ref_dir})", "",
+              "A constant extra push would raise Δdn by about the same amount in every imaging bin and send the "
+              "high-prior bins negative; the lab row should not move (the read is selective for imaging).", ""]
+        L += fmt_edit_compare(ecmp["all"], f"All {len(items)} patients (practice half's histories were seen in "
+                                           "fitting, with the orig wording only)")
+        if ecmp["test_half"]:
+            L += fmt_edit_compare(ecmp["test_half"], f"Test half only ({len(test_idx)} patients never seen)")
     L += ["## 2 Per test (mid-prior cases)", "",
           "up/ideal and down/ideal: model's mean move ÷ literature move (1 = exact). "
           "'negative raised belief' = mid-prior (case, wording) pairs where the negative moved belief toward Yes.", ""]
@@ -562,7 +664,7 @@ def main():
     (out / f"report{suffix}.json").write_text(json.dumps(
         {"model": args.model, "pb_range": pb, "token_check": tc, "mass_B_mean": float(np.mean(mass_B)),
          "general_acc": gen_acc, "history": hist, "prior_bands": pbands, "prior_bins": pbins,"per_test_all": pt_all,
-         "per_test_testhalf": pt_test, "cells_all": cells_all,
+         "per_test_testhalf": pt_test, "cells_all": cells_all, "edit_compare": ecmp, "edit": sanity.get("edit"),
          "abs_asym_all": abs_asym, "gate": {"checks": checks, "decision": decision}}, indent=1, default=str))
     print(f"GATE: {decision}\n-> {out / f'REPORT{suffix}.md'}", flush=True)
 
