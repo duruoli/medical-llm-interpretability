@@ -301,6 +301,55 @@ def prior_bands(rows, items, n_bands=4):
     return out
 
 
+PRIOR_BINS = [0, 0.01, 0.03, 0.10, 0.30, 0.70, 1.0]   # fixed, so bins line up across models and wordings
+PRIOR_BIN_LABELS = ["<1%", "1-3%", "3-10%", "10-30%", "30-70%", ">70%"]
+FAMILIES = {"CT diverticulitis": ["ct_sigmoid"], "appendicitis (CT+US)": ["ct_appendix", "us_appendix"],
+            "US cholecystitis": ["us_gallbladder"], "CT kidney stone": ["ct_kidney_stone"],
+            "lab (lipase+amylase)": ["lipase", "amylase"]}
+
+
+def prior_bins(rows, min_n=15):
+    """asym in FIXED prior bins, all cases (no mid-prior filter). Each case: move up / down averaged over
+    wordings, divided by its own test's ideal move; asym = ln(mean up ratio / mean down ratio).
+    Main stage-1 result since 2026-11-21: asym depends strongly on where the prior sits, so models and
+    wordings are only comparable bin by bin; the imaging-minus-lab gap within a bin is prior-matched."""
+    out = {}
+    for fam, tests in FAMILIES.items():
+        row = []
+        for lo, hi in zip(PRIOR_BINS[:-1], PRIOR_BINS[1:]):
+            ups, dns = [], []
+            for t in tests:
+                lu, ld = lit_moves(t)
+                for r in rows:
+                    if lo <= 1 / (1 + math.exp(-r[t]["B"])) < hi:
+                        ps = [p for p in r[t] if isinstance(r[t][p], dict)]
+                        ups.append(np.mean([r[t][p]["P"] - r[t]["B"] for p in ps]) / lu)
+                        dns.append(np.mean([r[t]["B"] - r[t][p]["N"] for p in ps]) / ld)
+            ok = len(ups) >= min_n
+            row.append({"n": len(ups), "asym": math.log(max(np.mean(ups), 0.03) / max(np.mean(dns), 0.03)) if ok else None,
+                        "up_over_ideal": float(np.mean(ups)) if ok else None,
+                        "down_over_ideal": float(np.mean(dns)) if ok else None})
+        out[fam] = row
+    return out
+
+
+def fmt_bins(pbins):
+    lab = pbins["lab (lipase+amylase)"]
+    L = ["## 1c asym by fixed prior bin (all patients; the comparable result)", "",
+         "Bayes: asym = 0 in every bin. A row that falls from left to right = updates shrink on the side the "
+         "belief is already near (compression). Within one column, rows are prior-matched: the gap to the lab "
+         "row is the test-type effect that does not come from the prior.", "",
+         "| family | " + " | ".join(PRIOR_BIN_LABELS) + " |", "|---|" + "---|" * len(PRIOR_BIN_LABELS)]
+    for fam, row in pbins.items():
+        L.append(f"| {fam} | " + " | ".join("–" if c["asym"] is None else f"{c['asym']:+.2f} ({c['n']})" for c in row) + " |")
+    gap = [[c["asym"] - l["asym"] for c, l in zip(row, lab) if c["asym"] is not None and l["asym"] is not None]
+           for fam, row in pbins.items() if not fam.startswith("lab")]
+    flat = [g for gs in gap for g in gs]
+    L += ["", f"- imaging minus lab, same bin: mean {np.mean(flat):+.2f} over {len(flat)} (family, bin) pairs"
+          if flat else "- imaging minus lab: no shared bins", ""]
+    return L
+
+
 def fmt_bands(pbands):
     L = ["## 1b Does a low starting belief compress the moves? (all patients, quartiles of no-result belief)", "",
          "Each test: four bands from lowest to highest no-result P(Yes). up/ideal, down/ideal and asym per band. "
@@ -461,6 +510,7 @@ def main():
     pt_test, _ = per_test(rows, items, test_idx, pb) if test_idx else ({}, {})
     hist = history_check(rows, items, pb)
     pbands = prior_bands(rows, items)
+    pbins = prior_bins(rows)
     gold = [a for _, a in GENERAL_YESNO]
     mass_B = [r[t]["mass_B"] for r in rows for t in r]
     abs_asym = float(np.mean([abs(c["asym"]) for c in cells_all.values()])) if cells_all else float("nan")
@@ -495,7 +545,7 @@ def main():
             L.append(f"| {test} | {h['pB_median']:.3f} | {h['pB_iqr'][0]:.3f}–{h['pB_iqr'][1]:.3f} | {h['m_sd']:.2f} | "
                      f"{h['frac_mid']:.2f} | {h['auc_true_disease']:.2f} | {h['pB_mean']:.3f} / {h['prevalence_pool']:.3f} | "
                      f"{h['pB_median_true']:.4f} / {h['pB_median_other']:.4f} |")
-    L += [""] + fmt_bands(pbands)
+    L += [""] + fmt_bands(pbands) + fmt_bins(pbins)
     L += ["## 2 Per test (mid-prior cases)", "",
           "up/ideal and down/ideal: model's mean move ÷ literature move (1 = exact). "
           "'negative raised belief' = mid-prior (case, wording) pairs where the negative moved belief toward Yes.", ""]
@@ -511,7 +561,7 @@ def main():
     (out / f"REPORT{suffix}.md").write_text("\n".join(L) + "\n")
     (out / f"report{suffix}.json").write_text(json.dumps(
         {"model": args.model, "pb_range": pb, "token_check": tc, "mass_B_mean": float(np.mean(mass_B)),
-         "general_acc": gen_acc, "history": hist, "prior_bands": pbands, "per_test_all": pt_all,
+         "general_acc": gen_acc, "history": hist, "prior_bands": pbands, "prior_bins": pbins,"per_test_all": pt_all,
          "per_test_testhalf": pt_test, "cells_all": cells_all,
          "abs_asym_all": abs_asym, "gate": {"checks": checks, "decision": decision}}, indent=1, default=str))
     print(f"GATE: {decision}\n-> {out / f'REPORT{suffix}.md'}", flush=True)

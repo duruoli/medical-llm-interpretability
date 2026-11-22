@@ -93,3 +93,17 @@ and every version is reported.
   unchanged question, in B, P and N alike, so it cancels in up/down. Why: MedGemma 4B and 27B put the
   no-result P(Yes) at about 0.1%, which is the floor, so too few mid-prior cases remain and they are skewed
   to true cases. Validity check: rerun Qwen3.5-9B with orig and with considering. asym must be about unchanged.
+- 2026-11-21 (KEY): §1c asym by FIXED prior bins (<1, 1-3, 3-10, 10-30, 30-70, >70%), all patients, imaging
+  families vs the lab row. Runs: Qwen3.5-9B orig/could, MedGemma-4B orig/could, MedGemma-27B orig.
+  Findings:
+  (1) In every model, wording and test, asym falls as the prior rises: positive at low priors, about 0 near
+      10-50%, negative above. Updates shrink on the side the belief is already near. Bayes says
+      asym = 0 in every bin. The same bin under a different wording gives a similar value (Qwen orig vs could
+      differ by about 0.3), so the prior, not the wording, sets most of asym.
+  (2) Within one bin, imaging sits above lab by +1.71 (Qwen orig), +1.34 (Qwen could) and +0.99 (MG4 could).
+      This test-type gap is what survives prior matching. The <1% bins are floor noise; the MG27 orig gap of
+      −0.44 comes from its <1% lab cell.
+  Consequence: the mid-prior mean asym (Qwen page, harness score) mixes the prior distribution with the effect,
+  and Qwen's "negatives under-used" holds at its typical priors (2-10%), not at 30-70%. Stage-1 headline =
+  §1c (slope over bins + imaging−lab gap in matched bins). Repair target to be decided.
+  Note: with a non-orig `--question`, `--out` gets `q_<question>` appended, so pass the model directory.
