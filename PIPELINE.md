@@ -89,3 +89,7 @@ and every version is reported.
       and low-prior cases may NOT be pooled.
   (b) a `source` column (neg under-used / pos over-used) plus a GATE note, because the repair direction depends on it;
   (c) `--from-margins` re-analysis without a GPU and `--pb-range` (non-default ranges are written to separate files).
+- 2026-11-21: `--question considering` adds "The emergency physician is considering {d}." before the
+  unchanged question, in B, P and N alike, so it cancels in up/down. Why: MedGemma 4B and 27B put the
+  no-result P(Yes) at about 0.1%, which is the floor, so too few mid-prior cases remain and they are skewed
+  to true cases. Validity check: rerun Qwen3.5-9B with orig and with considering. asym must be about unchanged.

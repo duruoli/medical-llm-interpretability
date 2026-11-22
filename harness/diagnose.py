@@ -134,6 +134,10 @@ QUESTIONS = {
     "orig":   "Does this patient have {d}?",
     "likely": "Is {d} a likely diagnosis for this patient?",
     "could":  "Could this patient have {d}?",
+    # same question, plus the clinical reason the test was ordered: raises the no-result prior (the test is
+    # done because the disease is suspected, as in the studies behind the literature LRs). The sentence is in
+    # B, P and N alike, so it cancels in up/down; run it on Qwen too to check it leaves asym unchanged.
+    "considering": "The emergency physician is considering {d}. Does this patient have {d}?",
 }
 Q_RE = re.compile(r"Does this patient have (.*)\?(\n\nAnswer Yes or No only\.)$", re.S)
 
