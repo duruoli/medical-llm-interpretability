@@ -442,8 +442,10 @@ def main():
                     help="question wording (orig = all earlier results); "
                     + "; ".join(f"{k}: {v}" for k, v in QUESTIONS.items()))
     args = ap.parse_args()
-    out = Path(args.out or f"results/diagnose/{args.model.split('/')[-1]}"
-               + ("" if args.question == "orig" else f"/q_{args.question}"))
+    # non-orig wordings ALWAYS go to a q_<name>/ subdir (also with --out), so they never overwrite orig results
+    out = Path(args.out or f"results/diagnose/{args.model.split('/')[-1]}")
+    if args.question != "orig":
+        out = out / f"q_{args.question}"
     out.mkdir(parents=True, exist_ok=True)
     pb = tuple(args.pb_range)
     suffix = "" if pb == tuple(PB_RANGE) else f"_pb{pb[0]:g}-{pb[1]:g}"
