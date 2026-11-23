@@ -1,0 +1,7 @@
+torch
+transformers>=5.2
+accelerate
+nnsight
+pandas
+matplotlib
+tabulate

@@ -1,0 +1,10 @@
+{
+  "permissions": {
+    "deny": [
+      "Read(./data/harness_test/**)",
+      "Edit(./harness/**)",
+      "Write(./harness/**)",
+      "Bash(python -m harness.final_eval*)"
+    ]
+  }
+}

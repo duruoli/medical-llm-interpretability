@@ -1,0 +1,10 @@
+# MIMIC-derived text: never commit (PhysioNet DUA). Copy to the GPU machine with scp.
+data/
+# harness output (default $HARNESS_OUT); contains model scores per MIMIC case
+out/
+results/
+runs/
+*.log
+__pycache__/
+.DS_Store
+.claude/settings.local.json
