@@ -116,3 +116,5 @@ and every version is reported.
   none/1/5/20/50/80% (one sentence after the history, same in B/P/N; 60 stratified patients by default). Report:
   A adoption (does the model take the stated level; AUC inside a level), B per level, C pooled curve binned by the
   model's actual prior, D shape (slope, balance point, floor, ceiling). Plan and reasons in `PLAN_crossmodel.md`.
+- 2026-11-22: `--batch` default 8 → 1. Llama-3.1-8B (bf16, H100) batch 8 vs 1 changed the no-result margin by up to 0.25
+  (gemma on CPU fp32 had been ≤ 0.0006). Batch 1 is exact and costs ~15 min per wording for an 8-9B model.

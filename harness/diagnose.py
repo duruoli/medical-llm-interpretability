@@ -552,7 +552,8 @@ def main():
     ap.add_argument("--model", required=True)
     ap.add_argument("--pool", default="data/sigmoid_pool.jsonl")
     ap.add_argument("--out", default=None, help="default results/diagnose/<model name>")
-    ap.add_argument("--batch", type=int, default=8, help="1 = no padding (exact); >1 = left-padded batches")
+    ap.add_argument("--batch", type=int, default=1, help="1 = no padding (exact, default); >1 = left-padded batches, "
+                    "only after checking vs batch 1 (Llama-3.1-8B bf16: B differs by up to 0.25 at batch 8)")
     ap.add_argument("--limit-cases", type=int, default=0, help="smoke test on the first N patients")
     ap.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu",
                     help="cuda (one GPU), auto (split over all visible GPUs), or cpu")
