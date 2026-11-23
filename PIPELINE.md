@@ -112,3 +112,7 @@ and every version is reported.
   Mid-prior cases and prior bins are chosen by the ORIGINAL model's belief, so selection does not move with the edit.
   First use: Qwen round-6 C3 under `--question could`. Question: is C3 a constant extra push on imaging negatives
   (high-prior bins overshoot), and does it stay imaging-selective when the prior distribution moves?
+- 2026-11-22: `harness/prior_ladder.py` (controlled prior): each patient is scored at stated pre-test probabilities
+  none/1/5/20/50/80% (one sentence after the history, same in B/P/N; 60 stratified patients by default). Report:
+  A adoption (does the model take the stated level; AUC inside a level), B per level, C pooled curve binned by the
+  model's actual prior, D shape (slope, balance point, floor, ceiling). Plan and reasons in `PLAN_crossmodel.md`.
