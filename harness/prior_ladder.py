@@ -104,8 +104,9 @@ def shape(curve):
         if len(pts) >= 3:
             x, y, w = map(np.array, zip(*pts))
             b, a = np.polyfit(x, y, 1, w=np.sqrt(w))
+            x0 = -a / b if b < 0 else None      # balance only where the data are (no extrapolation)
             res.update(slope=float(b), intercept=float(a),
-                       balance_p=float(sig(-a / b)) if b < 0 else None)
+                       balance_p=float(sig(x0)) if x0 is not None and x.min() <= x0 <= x.max() else None)
         ok = [c for c in row if c["asym"] is not None]
         if ok:
             res.update(floor_down=ok[0]["down_over_ideal"], floor_bin=PRIOR_BIN_LABELS[row.index(ok[0])],
