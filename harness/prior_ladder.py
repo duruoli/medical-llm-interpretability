@@ -192,7 +192,7 @@ def main():
     ap.add_argument("--question", default="orig", choices=list(QUESTIONS))
     ap.add_argument("--levels", type=float, nargs="+", default=LEVELS, help="stated pre-test probabilities (0-1)")
     ap.add_argument("--limit-cases", type=int, default=60, help="stratified subset (0 = all 188)")
-    ap.add_argument("--batch", type=int, default=8)
+    ap.add_argument("--batch", type=int, default=1, help="1 = exact (default); >1 drifts up to 0.25 on Llama bf16")
     ap.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     ap.add_argument("--from-margins", action="store_true", help="no GPU: re-analyse <out>/ladder*/margins.jsonl")
     args = ap.parse_args()
