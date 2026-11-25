@@ -74,7 +74,13 @@ ssh lambda-gpu nvidia-smi
 
 ## 4. 环境与文件
 
-### 4a. filesystem 里已有的东西（之前搭好，直接用）
+### 4a. filesystem 里已有的东西
+
+> 2026-11-25：下表是**旧** `medllm` 的内容，旧 filesystem 已删除。新建的 `medllm` 起初是空的，
+> 目前只搭了 echo 检查需要的部分：`venv/`、`hf/`（Qwen3.5-9B）、`medical-llm-interpretability/`。
+> Qwen3-14B、Neuron-Microscope、nm-venv、corpus 都**不在**，需要时按 4d 重建。
+
+（旧内容，仅供重建参考）
 
 | 路径（都在 `/lambda/nfs/medllm/` 下） | 内容 |
 |---|---|

@@ -162,6 +162,163 @@ REPAIR_HELDOUT_TESTS = {
     },
 }
 
+# ---- echo domain (MIMIC-IV-Echo cohort; build_echo_cases.py, diagnose --domain echo) --------------
+# Same pipeline, new data: ED patients with chest pain / shortness of breath whose stay included a TTE.
+# True disease = primary ICD diagnosis (heart_failure / acute_mi / pneumonia / pulmonary_embolism).
+# Nothing is fitted here: the abdominal-domain edit is applied as is.
+ECHO_PROMPT = (
+    "An emergency department patient presents with chest pain or shortness of breath.\n\n"
+    "Patient history:\n{history}\n\n"
+    "New test result:\n{result}\n\n"
+    "Does this patient have {target_name}?\n"
+    "\nAnswer Yes or No only."
+)
+
+ECHO_LIT = {
+    # imaging
+    "tte_rwma_mi":   (0.79, 0.87),   # cardiac US for acute myocardial ischemia in the ED, 29 studies (Zarama 2024, SJTREM, PMID 38468316)
+    "tte_rv_pe":     (0.53, 0.83),   # TTE "right heart strain" for PE (Fields 2017, J Am Soc Echocardiogr, PMID 28495379)
+    "ctpa_pe":       (0.83, 0.96),   # CT pulmonary angiography, PIOPED II (Stein 2006, NEJM)
+    "cxr_hf":        (0.73, 0.90),   # chest radiograph for acute decompensated HF (Maw 2019, JAMA Netw Open, PMID 30874784)
+    "lus_hf":        (0.88, 0.90),   # lung ultrasound B-lines for acute decompensated HF (same meta-analysis)
+    "cxr_pneumonia": (0.77, 0.91),   # chest radiograph vs discharge diagnosis, 5-study LUS-vs-CXR meta-analysis (PLoS ONE 2015)
+    # labs (controls)
+    "troponin_mi":   (0.895, 0.771), # single baseline hs-cTnT (Elecsys) in the ED, pooled (Heart 2015); TODO confirm cut-off = 14 ng/L
+    "ntprobnp_hf":   (0.79, 0.84),   # NT-proBNP 900 pg/mL rule-in, age 50-75 (ICON-RELOADED, Januzzi 2018)
+    "ddimer_pe":     (0.95, 0.40),   # PROVISIONAL: Cochrane CD010864 gives only ranges (sens .80-1.00, spec .23-.63); TODO pooled source
+}
+LIT.update(ECHO_LIT)
+
+ECHO_TESTS = {
+    "tte_rwma_mi": {
+        "target_name": "an acute myocardial infarction",
+        "baseline": "Transthoracic echocardiogram: result pending.",
+        "pairs": {
+            "lexical": ("Transthoracic echocardiogram: left ventricular wall motion abnormal.",
+                        "Transthoracic echocardiogram: left ventricular wall motion normal."),
+            "impression": ("Transthoracic echocardiogram impression: New regional wall motion abnormality.",
+                           "Transthoracic echocardiogram impression: No regional wall motion abnormality."),
+            "full_impression": (
+                "Transthoracic echocardiogram impression: Hypokinesis of the inferior and inferolateral walls, "
+                "suggestive of ischemia in the right coronary artery territory.",
+                "Transthoracic echocardiogram impression: Normal regional and global left ventricular systolic "
+                "function. No wall motion abnormality to suggest ischemia."),
+            "findings": (
+                "Transthoracic echocardiogram: The inferior and inferolateral walls are hypokinetic. LVEF 50%.",
+                "Transthoracic echocardiogram: All left ventricular segments contract normally. LVEF 60%."),
+        },
+    },
+    "tte_rv_pe": {
+        "target_name": "a pulmonary embolism",
+        "baseline": "Transthoracic echocardiogram: result pending.",
+        "pairs": {
+            "lexical": ("Transthoracic echocardiogram: right ventricle enlarged.",
+                        "Transthoracic echocardiogram: right ventricle normal."),
+            "impression": (
+                "Transthoracic echocardiogram impression: Right ventricular dilation and dysfunction, consistent "
+                "with acute right heart strain.",
+                "Transthoracic echocardiogram impression: Normal right ventricular size and function. No "
+                "echocardiographic evidence of right heart strain."),
+            "findings": (
+                "Transthoracic echocardiogram: The right ventricle is dilated (RV/LV ratio 1.2) with free wall "
+                "hypokinesis and apical sparing.",
+                "Transthoracic echocardiogram: The right ventricle is normal in size and systolic function "
+                "(RV/LV ratio 0.7)."),
+        },
+    },
+    "ctpa_pe": {
+        "target_name": "a pulmonary embolism",
+        "baseline": "CT pulmonary angiogram: result pending.",
+        "pairs": {
+            "impression": ("CT pulmonary angiogram impression: Acute pulmonary embolism.",
+                           "CT pulmonary angiogram impression: No evidence of pulmonary embolism."),
+            "full_impression": (
+                "CT pulmonary angiogram impression: Acute pulmonary emboli in the right lower lobe segmental "
+                "and subsegmental arteries.",
+                "CT pulmonary angiogram impression: No pulmonary embolism to the subsegmental level. No acute "
+                "intrathoracic process."),
+            "findings": (
+                "CT pulmonary angiogram: Filling defects are seen in the right lower lobe segmental pulmonary "
+                "arteries.",
+                "CT pulmonary angiogram: The pulmonary arteries opacify well without filling defects."),
+        },
+    },
+    "cxr_hf": {
+        "target_name": "acute decompensated heart failure",
+        "baseline": "Chest radiograph: result pending.",
+        "pairs": {
+            "impression": ("Chest radiograph impression: Pulmonary edema.",
+                           "Chest radiograph impression: No pulmonary edema."),
+            "full_impression": (
+                "Chest radiograph impression: Pulmonary vascular congestion and interstitial edema, consistent "
+                "with congestive heart failure.",
+                "Chest radiograph impression: No pulmonary vascular congestion or edema. No acute "
+                "cardiopulmonary process."),
+            "findings": (
+                "Chest radiograph: Cephalization of the pulmonary vessels, interstitial edema with Kerley B "
+                "lines and small bilateral pleural effusions.",
+                "Chest radiograph: The pulmonary vasculature is normal. The lungs are clear without edema or "
+                "effusion."),
+        },
+    },
+    "lus_hf": {
+        "target_name": "acute decompensated heart failure",
+        "baseline": "Lung ultrasound: result pending.",
+        "pairs": {
+            "impression": (
+                "Lung ultrasound impression: Diffuse bilateral B-lines, consistent with pulmonary edema.",
+                "Lung ultrasound impression: Bilateral A-line pattern, no evidence of pulmonary edema."),
+            "findings": (
+                "Lung ultrasound: Three or more B-lines in multiple zones of both lungs.",
+                "Lung ultrasound: A-lines with lung sliding in all zones; no B-line pattern."),
+        },
+    },
+    "cxr_pneumonia": {
+        "target_name": "pneumonia",
+        "baseline": "Chest radiograph: result pending.",
+        "pairs": {
+            "impression": ("Chest radiograph impression: Right lower lobe pneumonia.",
+                           "Chest radiograph impression: No evidence of pneumonia."),
+            "full_impression": (
+                "Chest radiograph impression: Focal consolidation in the right lower lobe, consistent with "
+                "pneumonia.",
+                "Chest radiograph impression: No focal consolidation to suggest pneumonia. No acute "
+                "cardiopulmonary process."),
+            "findings": (
+                "Chest radiograph: There is a focal opacity in the right lower lobe with air bronchograms.",
+                "Chest radiograph: The lungs are clear. No focal opacity, effusion or pneumothorax."),
+        },
+    },
+    "troponin_mi": {
+        "target_name": "an acute myocardial infarction",
+        "baseline": "High-sensitivity troponin T: result pending.",
+        "pairs": {
+            "numeric": ("High-sensitivity troponin T: 86 ng/L (99th percentile upper reference limit 14 ng/L).",
+                        "High-sensitivity troponin T: 6 ng/L (99th percentile upper reference limit 14 ng/L)."),
+            "lexical": ("High-sensitivity troponin T elevated above the 99th percentile upper reference limit.",
+                        "High-sensitivity troponin T within normal limits."),
+        },
+    },
+    "ntprobnp_hf": {
+        "target_name": "acute decompensated heart failure",
+        "baseline": "NT-proBNP: result pending.",
+        "pairs": {
+            "numeric": ("NT-proBNP: 4850 pg/mL (reference below 125 pg/mL).",
+                        "NT-proBNP: 85 pg/mL (reference below 125 pg/mL)."),
+            "lexical": ("NT-proBNP markedly elevated.", "NT-proBNP within normal limits."),
+        },
+    },
+    "ddimer_pe": {
+        "target_name": "a pulmonary embolism",
+        "baseline": "D-dimer: result pending.",
+        "pairs": {
+            "numeric": ("D-dimer: 2450 ng/mL FEU (reference below 500 ng/mL FEU).",
+                        "D-dimer: 230 ng/mL FEU (reference below 500 ng/mL FEU)."),
+            "lexical": ("D-dimer elevated.", "D-dimer within normal limits."),
+        },
+    },
+}
+
 SUITES = {
     "v1": {"practice": "data/harness/practice.jsonl", "test": "data/harness_test/test.jsonl",
            "practice_extra": {}, "heldout_wordings": HELDOUT_WORDINGS, "heldout_tests": HELDOUT_TESTS},

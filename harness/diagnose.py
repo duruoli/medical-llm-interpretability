@@ -44,11 +44,44 @@ GATE = {
     "min_mid": 30,             # mid-prior cases per test, else that test is under-powered
 }
 
-IMAGING = ["ct_sigmoid", "ct_kidney_stone", "ct_appendix", "us_gallbladder", "us_appendix"]
-LAB = ["lipase", "amylase"]
-TEST_DISEASE = {"ct_sigmoid": "diverticulitis", "ct_appendix": "appendicitis", "us_appendix": "appendicitis",
-                "us_gallbladder": "cholecystitis", "lipase": "pancreatitis", "amylase": "pancreatitis",
-                "ct_kidney_stone": None}
+# Domain = which data set / prompt family. "abd" is every earlier result (MIMIC abdominal, suite "repair").
+# "echo" = MIMIC-IV-Echo cohort (build_echo_cases.py writes ready items; no practice/test split).
+DOMAINS = {
+    "abd": {
+        "imaging": ["ct_sigmoid", "ct_kidney_stone", "ct_appendix", "us_gallbladder", "us_appendix"],
+        "lab": ["lipase", "amylase"],
+        "test_disease": {"ct_sigmoid": "diverticulitis", "ct_appendix": "appendicitis",
+                         "us_appendix": "appendicitis", "us_gallbladder": "cholecystitis",
+                         "lipase": "pancreatitis", "amylase": "pancreatitis", "ct_kidney_stone": None},
+        "families": {"CT diverticulitis": ["ct_sigmoid"], "appendicitis (CT+US)": ["ct_appendix", "us_appendix"],
+                     "US cholecystitis": ["us_gallbladder"], "CT kidney stone": ["ct_kidney_stone"],
+                     "lab (lipase+amylase)": ["lipase", "amylase"]},
+        "pool": "data/sigmoid_pool.jsonl", "out": "results/diagnose",
+    },
+    "echo": {
+        "imaging": ["tte_rwma_mi", "tte_rv_pe", "ctpa_pe", "cxr_hf", "lus_hf", "cxr_pneumonia"],
+        "lab": ["troponin_mi", "ntprobnp_hf", "ddimer_pe"],
+        "test_disease": {"tte_rwma_mi": "acute_mi", "troponin_mi": "acute_mi",
+                         "tte_rv_pe": "pulmonary_embolism", "ctpa_pe": "pulmonary_embolism",
+                         "ddimer_pe": "pulmonary_embolism", "cxr_hf": "heart_failure", "lus_hf": "heart_failure",
+                         "ntprobnp_hf": "heart_failure", "cxr_pneumonia": "pneumonia"},
+        "families": {"TTE (wall motion + RV)": ["tte_rwma_mi", "tte_rv_pe"], "CT PE": ["ctpa_pe"],
+                     "CXR (HF + pneumonia)": ["cxr_hf", "cxr_pneumonia"], "lung US HF": ["lus_hf"],
+                     "lab (troponin+NT-proBNP+D-dimer)": ["troponin_mi", "ntprobnp_hf", "ddimer_pe"]},
+        "pool": "data/echo_pool.jsonl", "out": "results/diagnose_echo",
+    },
+}
+IMAGING = LAB = TEST_DISEASE = FAMILIES = LAB_FAM = None
+
+
+def set_domain(name):
+    global IMAGING, LAB, TEST_DISEASE, FAMILIES, LAB_FAM
+    d = DOMAINS[name]
+    IMAGING, LAB, TEST_DISEASE, FAMILIES = d["imaging"], d["lab"], d["test_disease"], d["families"]
+    LAB_FAM = next(f for f in FAMILIES if f.startswith("lab"))
+
+
+set_domain("abd")
 
 
 # ---- model ---------------------------------------------------------------------------------
@@ -149,21 +182,23 @@ def reword(text, q):
     return text[:m.start()] + QUESTIONS[q].format(d=m.group(1)) + m.group(2)
 
 
-def build_items(pool_path, limit, question="orig"):
-    suite = SUITES["repair"]
+def build_items(pool_path, limit, question="orig", domain="abd"):
     pool = [json.loads(l) for l in open(pool_path)]
-    # same patient split as harness/make_splits.py (seed 0) -> mark the 94-patient test half
     rng, test_ids = random.Random(0), set()
-    for dz in sorted({c["true_disease"] for c in pool}):
-        cs = [c for c in pool if c["true_disease"] == dz]
-        rng.shuffle(cs)
-        test_ids |= {c["hadm_id"] for c in cs[len(cs) // 2:]}
+    if domain == "abd":
+        # same patient split as harness/make_splits.py (seed 0) -> mark the 94-patient test half
+        for dz in sorted({c["true_disease"] for c in pool}):
+            cs = [c for c in pool if c["true_disease"] == dz]
+            rng.shuffle(cs)
+            test_ids |= {c["hadm_id"] for c in cs[len(cs) // 2:]}
     if limit:   # stratified subset: round-robin over true diseases, so AUCs are defined
         by = {dz: [c for c in pool if c["true_disease"] == dz] for dz in sorted({c["true_disease"] for c in pool})}
         pool = [by[dz][k] for k in range(max(map(len, by.values()))) for dz in by if k < len(by[dz])][:limit]
-    items = [item_from_pool(c, suite, True) for c in pool]
+    # abd: grafted from the sigmoid pool; other domains: the pool already holds finished items
+    items = [item_from_pool(c, SUITES["repair"], True) for c in pool] if domain == "abd" else pool
     for it in items:
-        it["split"] = "test" if it["hadm_id"] in test_ids else "practice"
+        # non-abd domains were never split (nothing is fitted on them): no "test half"
+        it["split"] = ("test" if it["hadm_id"] in test_ids else "practice") if domain == "abd" else "all"
         if question != "orig":
             for t in it["tests"].values():
                 t["B"] = reword(t["B"], question)
@@ -305,9 +340,6 @@ def prior_bands(rows, items, n_bands=4):
 
 PRIOR_BINS = [0, 0.01, 0.03, 0.10, 0.30, 0.70, 1.0]   # fixed, so bins line up across models and wordings
 PRIOR_BIN_LABELS = ["<1%", "1-3%", "3-10%", "10-30%", "30-70%", ">70%"]
-FAMILIES = {"CT diverticulitis": ["ct_sigmoid"], "appendicitis (CT+US)": ["ct_appendix", "us_appendix"],
-            "US cholecystitis": ["us_gallbladder"], "CT kidney stone": ["ct_kidney_stone"],
-            "lab (lipase+amylase)": ["lipase", "amylase"]}
 
 
 def prior_bins(rows, min_n=15, sel_rows=None, ref_rows=None):
@@ -363,7 +395,7 @@ def fmt_edit_compare(cmp, title):
             cells.append(f"{o['asym']:+.2f}→{e['asym']:+.2f}<br>Δdn {e['down_over_ideal'] - o['down_over_ideal']:+.2f} "
                          f"Δup {e['up_over_ideal'] - o['up_over_ideal']:+.2f}<br>drift {e['drift']:+.2f} (n {o['n']})")
         L.append(f"| {fam} | " + " | ".join(cells) + " |")
-    lab_o, lab_e = cmp["orig"]["lab (lipase+amylase)"], cmp["edit"]["lab (lipase+amylase)"]
+    lab_o, lab_e = cmp["orig"][LAB_FAM], cmp["edit"][LAB_FAM]
     gaps = {"orig": [], "edit": []}
     for fam in FAMILIES:
         if fam.startswith("lab"):
@@ -380,7 +412,7 @@ def fmt_edit_compare(cmp, title):
 
 
 def fmt_bins(pbins):
-    lab = pbins["lab (lipase+amylase)"]
+    lab = pbins[LAB_FAM]
     L = ["## 1c asym by fixed prior bin (all patients; the comparable result)", "",
          "Bayes: asym = 0 in every bin. A row that falls from left to right = updates shrink on the side the "
          "belief is already near (compression). Within one column, rows are prior-matched: the gap to the lab "
@@ -550,8 +582,11 @@ def load_margins(out, items):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--model", required=True)
-    ap.add_argument("--pool", default="data/sigmoid_pool.jsonl")
-    ap.add_argument("--out", default=None, help="default results/diagnose/<model name>")
+    ap.add_argument("--domain", default="abd", choices=list(DOMAINS),
+                    help="abd = MIMIC abdominal (all earlier results); echo = MIMIC-IV-Echo cohort")
+    ap.add_argument("--pool", default=None, help="default: the domain's pool (abd data/sigmoid_pool.jsonl, "
+                                                 "echo data/echo_pool.jsonl)")
+    ap.add_argument("--out", default=None, help="default results/diagnose[_echo]/<model name>")
     ap.add_argument("--batch", type=int, default=1, help="1 = no padding (exact, default); >1 = left-padded batches, "
                     "only after checking vs batch 1 (Llama-3.1-8B bf16: B differs by up to 0.25 at batch 8)")
     ap.add_argument("--limit-cases", type=int, default=0, help="smoke test on the first N patients")
@@ -570,8 +605,10 @@ def main():
     ap.add_argument("--scale", type=float, default=1.0)
     ap.add_argument("--control", action="store_true", help="with --edit: random control (same support and norm)")
     args = ap.parse_args()
+    set_domain(args.domain)
+    args.pool = args.pool or DOMAINS[args.domain]["pool"]
     # non-orig wordings ALWAYS go to a q_<name>/ subdir (also with --out), so they never overwrite orig results
-    out = Path(args.out or f"results/diagnose/{args.model.split('/')[-1]}")
+    out = Path(args.out or f"{DOMAINS[args.domain]['out']}/{args.model.split('/')[-1]}")
     if args.question != "orig":
         out = out / f"q_{args.question}"
     ref_dir = None
@@ -584,7 +621,7 @@ def main():
     pb = tuple(args.pb_range)
     suffix = "" if pb == tuple(PB_RANGE) else f"_pb{pb[0]:g}-{pb[1]:g}"
 
-    items = build_items(args.pool, args.limit_cases, args.question)
+    items = build_items(args.pool, args.limit_cases, args.question, args.domain)
     rows, sanity = load_margins(out, items) if args.from_margins else run_model(args, items, out)
     tc, gen_acc = sanity["token_check"], sanity["general_acc"]
     ref_rows = None

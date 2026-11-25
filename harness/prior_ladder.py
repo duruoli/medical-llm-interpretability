@@ -130,6 +130,20 @@ def adoption(rows, items):
     return out
 
 
+def adoption_logodds(levels, rows_by):
+    """Per family, on the log-odds scale (P(Yes) hides movement near 0 or 1): median no-result log-odds per level,
+    and the slope of the model's log-odds on the stated log-odds (stated levels only; same patient-test pairs
+    across levels). 1 = moves one-for-one with the stated level, 0 = ignores it."""
+    stated = [(k, l) for k, l in enumerate(levels) if l is not None]
+    out = {}
+    for fam, tests in FAMILIES.items():
+        med = {lab(l): float(np.median([r[t]["B"] for r in rows_by[k] for t in tests])) for k, l in enumerate(levels)}
+        x = np.array([math.log(l / (1 - l)) for k, l in stated for r in rows_by[k] for t in tests])
+        y = np.array([r[t]["B"] for k, l in stated for r in rows_by[k] for t in tests])
+        out[fam] = {"B_median": med, "slope": float(np.polyfit(x, y, 1)[0]) if len(stated) >= 2 else None}
+    return out
+
+
 def report(levels, rows_by, items, mass_by, args, sanity):
     L = [f"# Controlled-prior ladder: {args.model}  (question: {QUESTIONS[args.question]})", "",
          f"{len(items)} patients x levels {[lab(l) for l in levels]}. Sentence (after the history, same in B/P/N): "
@@ -147,6 +161,14 @@ def report(levels, rows_by, items, mass_by, args, sanity):
             au = "" if a["auc_true"] is None else f" AUC {a['auc_true']:.2f}"
             cells.append(f"{a['pB_median']:.3f} [{a['pB_iqr'][0]:.3f}–{a['pB_iqr'][1]:.3f}]{au}")
         L.append(f"| {fam} | " + " | ".join(cells) + " |")
+    ado = adoption_logodds(levels, rows_by)
+    L += ["", "Same on the log-odds scale (0 = 50%, −2.9 = 5%, −4.6 = 1%; stated levels span −4.6 → +1.4). "
+          "slope = model log-odds per +1 stated log-odds (1 = fully adopted, 0 = ignored).", "",
+          "| family | " + " | ".join(lab(l) for l in levels) + " | slope |", "|---|" + "---|" * (len(levels) + 1)]
+    for fam in FAMILIES:
+        a = ado[fam]
+        L.append(f"| {fam} | " + " | ".join(f"{a['B_median'][lab(l)]:+.1f}" for l in levels)
+                 + f" | {'–' if a['slope'] is None else format(a['slope'], '+.2f')} |")
     L += ["", "P(Yes)+P(No), mean over all prompts of a level: "
           + ", ".join(f"{lab(l)} {mass_by[k]:.3f}" for k, l in enumerate(levels))
           + "  (well below 0.9 = the sentence breaks the answer format; read that level with care)", "",

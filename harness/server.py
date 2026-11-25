@@ -1,7 +1,7 @@
 """GPU service for the weight-edit researcher: holds the model, enforces the rules and budget.
 
 Start once per GPU session (repo root, inside tmux):
-  python -m harness.server --model Qwen/Qwen3.5-9B --out /scratch/dlf8982/harness
+  python -m harness.server --model Qwen/Qwen3.5-9B --out /projects/p53430/medllm/harness
 It loads the model, scores the ORIGINAL model on the practice split once (free, the
 reference), writes <out>/model_info.json, then listens on 127.0.0.1:<port>.
 Talk to it with  python -m harness.client <command>  (see client.py / HANDOFF_weight_edit.md).
@@ -258,7 +258,7 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--model", default="Qwen/Qwen3.5-9B")
     ap.add_argument("--practice", default="data/harness/practice.jsonl")
-    ap.add_argument("--out", default="/scratch/dlf8982/harness")
+    ap.add_argument("--out", default="/projects/p53430/medllm/harness")
     ap.add_argument("--port", type=int, default=8765)
     ap.add_argument("--device", default="auto")
     ap.add_argument("--limit-cases", type=int, default=0, help="smoke test: first N practice patients")

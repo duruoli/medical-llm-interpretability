@@ -22,7 +22,7 @@ written into the "Change log" at the bottom with a reason, so results across mod
 ## Stage 1 — diagnose (behaviour only, no edits)
 
 ```
-python -m harness.diagnose --model <hf id> --out /scratch/dlf8982/diagnose/<model>   # → REPORT.md; scp back to results/diagnose/<model>/
+python -m harness.diagnose --model <hf id> --out /projects/p53430/medllm/diagnose/<model>   # → REPORT.md; scp back to results/diagnose/<model>/
 ```
 
 All 188 patients × all tests and wordings on the original model. The report starts with a GATE:
@@ -118,3 +118,10 @@ and every version is reported.
   model's actual prior, D shape (slope, balance point, floor, ceiling). Plan and reasons in `PLAN_crossmodel.md`.
 - 2026-11-22: `--batch` default 8 → 1. Llama-3.1-8B (bf16, H100) batch 8 vs 1 changed the no-result margin by up to 0.25
   (gemma on CPU fp32 had been ≤ 0.0006). Batch 1 is exact and costs ~15 min per wording for an 8-9B model.
+- 2026-11-24: new DATA, same pipeline: `--domain echo` (MIMIC-IV-Echo cohort). `extract_echo_mimic.sh` (BigQuery →
+  `data/raw/echo_mimiciv_3_1/`) → `build_echo_cases.py` → `data/echo_pool.jsonl` (188 = 47 × heart failure / acute MI /
+  pneumonia / PE by primary ICD; ED admissions with a TTE). 9 tests: imaging TTE wall motion (MI), TTE RV strain (PE),
+  CTPA (PE), CXR (HF, pneumonia), lung US (HF); labs troponin T, NT-proBNP, D-dimer. Prompts/LR in `config.ECHO_*`.
+  Filter differs from abd (agreed): HPI cut at the ED course; HPI clean of tests/diagnoses; PMH may name old
+  diagnoses but no tests. No practice/test split (nothing is fitted here; the abd edit is applied as is).
+  D-dimer LR is provisional (Cochrane gives ranges only); troponin cut-off to confirm.
