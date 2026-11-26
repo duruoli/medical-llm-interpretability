@@ -326,6 +326,17 @@ SUITES = {
     "repair": {"practice": "data/harness/repair_practice.jsonl", "test": "data/harness_test/repair_test.jsonl",
                "practice_extra": REPAIR_PRACTICE_EXTRA, "heldout_wordings": REPAIR_HELDOUT_WORDINGS,
                "heldout_tests": REPAIR_HELDOUT_TESTS},
+    # Per-model split (PIPELINE.md "Per-model split", fixed 2026-11-26). Same principle as `repair`, re-applied
+    # to Llama's own stage-1 numbers (diagnose q_orig, mid prior): practice = targets + one balanced control,
+    # held out = at least one imaging target, one lab target and one balanced control.
+    #   practice: ct_sigmoid +0.74, ct_appendix +1.14, lipase +2.27 (targets); ct_kidney_stone +0.08 (control)
+    #   held out: us_appendix +2.22, amylase +1.32 (targets); us_gallbladder +0.10 (control); new wordings
+    "repair_llama": {"practice": "data/harness/repair_llama_practice.jsonl",
+                     "test": "data/harness_test/repair_llama_test.jsonl",
+                     "practice_extra": {"lipase": HELDOUT_TESTS["lipase"],
+                                        "ct_kidney_stone": REPAIR_HELDOUT_TESTS["ct_kidney_stone"]},
+                     "heldout_wordings": REPAIR_HELDOUT_WORDINGS,
+                     "heldout_tests": {k: v for k, v in REPAIR_HELDOUT_TESTS.items() if k != "ct_kidney_stone"}},
 }
 
 # ---- edit arms (repair suite) ------------------------------------------------------------

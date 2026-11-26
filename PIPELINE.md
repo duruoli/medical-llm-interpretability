@@ -1,9 +1,16 @@
 # Pipeline: diagnose → repair → evaluate (any model)
 
 Goal: take a new model X and answer, with the same yardstick every time,
-(1) does X under-use negative imaging results relative to the literature?
+(1) does X weight negative results less than positive ones, relative to the literature (asym > 0)?
 (2) can a small weight edit repair it without breaking anything? (3) does the repair hold on
 patients, wordings and tests the edit never saw?
+
+**Repair target (fixed 2026-11-26): the RELATIVE weight of negative vs positive evidence only**, i.e. bring
+each test's asym toward 0 so that negatives stop counting less than positives. The model's overall
+over-reaction (both up and down larger than the literature; the scale k in `results/diagnose`) is a
+separate problem and is not repaired; an edit only must not make it worse (`move_err` guard). An argument
+of the form "the down move is already N× the literature" is not a reason against an edit; the relative
+version of that worry is handled by the control test (below).
 
 The framework below is fixed. Details (thresholds, budgets, arms) may change, but every change is
 written into the "Change log" at the bottom with a reason, so results across models stay comparable.
@@ -18,6 +25,27 @@ written into the "Change log" at the bottom with a reason, so results across mod
 | metric: `asym = ln(up/down) − ln(ideal up/ideal down)`, mid-prior cases only (P(Yes) 0.02–0.95 on the original model) | `harness/core.py: cell_stats` |
 | repair score: mean \|asym\| over (test, wording) cells | `core.report` |
 | guards: no-result drift, general yes/no 40/40, history NLL | `core.report` |
+
+## Per-model split (fixed 2026-11-26)
+
+What is fixed across models is the **principle** of the practice / held-out split, not the list of tests.
+Each model gets its own suite in `config.SUITES`, chosen from ITS stage-1 numbers (diagnose, original
+question, mid prior), before any repair:
+
+- **Practice = repair targets + one control.** Targets: tests with asym clearly > 0 on this model.
+  Control: one test that is already balanced (asym ≈ 0) on this model, the "do not break it" check.
+- **Held out = at least one imaging target, one lab target and one balanced control**, plus the new wordings.
+  The held-out targets test transfer; the held-out control tests selectivity.
+- The patient split (seed 0, 94/94) never changes.
+- Record the suite and the stage-1 asym of every test in a `config.py` comment and in the change log.
+
+| model | suite | practice targets | practice control | held-out targets | held-out control |
+|---|---|---|---|---|---|
+| Qwen3.5-9B | `repair` | CT sigmoid, CT appendix | lipase (−0.41) | US appendix, CT kidney stone, US gallbladder | amylase (−0.22) |
+| Llama-3.1-8B | `repair_llama` | CT sigmoid +0.74, CT appendix +1.14, lipase +2.27 | CT kidney stone +0.08 | US appendix +2.22, amylase +1.32 | US gallbladder +0.10 |
+
+The stage-1 gate's "DISCUSS: labs biased too" therefore no longer blocks a repair: it only means the
+lab test is a target, not the control, on that model.
 
 ## Stage 1 — diagnose (behaviour only, no edits)
 
@@ -39,19 +67,27 @@ All 188 patients × all tests and wordings on the original model. The report sta
 
 ## Stage 2 — repair (harness server + researcher agent)
 
-Same server and rules as round 6 (`harness/server.py`, `HANDOFF_round6.md`): the agent sees only the
-practice half (CT diverticulitis, CT appendicitis, lipase as the do-not-break control) and has a fixed budget.
-Two phases, logged separately so the result says whether the *recipe* transferred:
+Same server, scoring and guards as round 6 (`harness/server.py`); the agent sees only the practice half of
+the model's own suite (see "Per-model split") and has a fixed budget. **Order fixed 2026-11-26: blind first,
+the Qwen pattern last**, so that a match with Qwen is evidence of shared structure, not of a guided search.
 
-- **2A — recipe transfer (capped, e.g. ≤ 15 score calls).** Only the Qwen-validated recipe: a ridge-fitted
-  *selective read* in late layers (fires on CT negatives, not on lab negatives) → rank-1 write toward "No"
-  (C3 = mixer/attention write + last-layer MLP read). The only free choices are the layer and the dose.
-- **2B — free exploration.** Only if 2A fails a guard or leaves |asym| > ~0.4, or if stage 1 showed a new
-  pattern.
+- **2B — blind free exploration (first).** The agent gets the harness, the rules, the metric and the
+  model's practice split, and NOTHING learned on earlier models. It works in a clean copy built by
+  `blind_setup.py` (code with neutral docstrings, a rebuilt `config.py` without comments or held-out
+  names, the practice file, a blind brief such as `HANDOFF_blind_llama.md`, deny rules for the repo and
+  earlier round directories; the script refuses to finish if a leak word is found). One free arm (any
+  layer, attention or MLP). Budget 100 score calls, 8000 probes. Deliverables: NOTEBOOK, REPORT (causal
+  story, edit anatomy), FINAL edit + up to two pre-registered fallbacks.
+- **Pre-registered comparison with Qwen (after 2B, before 2A).** A fixed script, no agent, measures the
+  criteria written in `PLAN_crossmodel.md` §7 on the new model and on Qwen with identical code; the blind
+  agent's mechanism is then compared with them.
+- **2A — recipe transfer (last, capped ≤ 15 score calls).** Only now the Qwen recipe is given as a hint:
+  a selective read in late layers → rank-1 write toward "No" (C3 = attention/mixer write + last-layer
+  MLP read), placed by relative depth. Logged separately; reported as "recipe transferred: yes/no".
 
-Per-model input = a **model profile**: number of layers, module names, and edit arms placed by
-*relative* depth instead of Qwen layer numbers. This is not written yet. Current `config.ARMS` is
-Qwen-specific: `linear_attn` and L23-31.
+Per-model input = a model profile: number of layers and module names (from `model_info.json`); arms by
+*relative* depth. The repo's `config.ARMS` stays Qwen-specific (`linear_attn`, L23–31); a blind copy
+replaces it with one free arm.
 
 ## Stage 3 — evaluate (human runs it; the agent never sees the test half)
 
@@ -59,14 +95,15 @@ Qwen-specific: `linear_attn` and L23-31.
 python -m harness.final_eval --suite repair --model <hf id> --edit FINAL_*.pt --arm ... --scales ...
 ```
 
-On the 94 test patients: the seen tests on new patients, plus new wordings and new tests
-(US gallbladder, US appendix, CT kidney stone, amylase). Each edit is compared with a random control
+On the 94 test patients: the seen tests on new patients, plus new wordings and the suite's held-out
+tests (Qwen `repair`: US gallbladder, US appendix, CT kidney stone, amylase; Llama `repair_llama`:
+US gallbladder, US appendix, amylase). Pass the model's own `--suite`. Each edit is compared with a random control
 of the same size and position. Fallback doses are pre-registered in 2A/2B before any held-out scoring,
 and every version is reported.
 
 **Success** means all of these hold:
 - held-out |asym| drops clearly, judged against the original model and the random control;
-- the labs stay where they were;
+- the held-out control test stays where it was (|asym| no worse by more than 0.1);
 - negatives that raised belief mostly disappear;
 - drift ≤ 0.15, 40/40 general questions correct, ΔNLL ≤ 0.01.
 
@@ -74,8 +111,9 @@ and every version is reported.
 
 1. Download weights once (gated models: accept the license on HF first).
 2. Stage 1 → read the GATE.
-3. If PROCEED: write the model profile, start a new server out dir (fresh budget), write a round brief
-   from the 2A/2B template.
+3. If PROCEED or DISCUSS-labs-biased: pick the model's suite by the per-model split rule (no need to
+   re-ask), `make_splits --suite <suite>`, write a blind brief from `HANDOFF_blind_llama.md`,
+   `blind_setup.py`, start a new server out dir (fresh budget) from the clean copy.
 4. Stage 3 → write-up: the same figures as the Qwen page, plus "recipe transferred: yes/no, N calls".
 
 ## Change log
@@ -125,3 +163,16 @@ and every version is reported.
   Filter differs from abd (agreed): HPI cut at the ED course; HPI clean of tests/diagnoses; PMH may name old
   diagnoses but no tests. No practice/test split (nothing is fitted here; the abd edit is applied as is).
   D-dimer LR is provisional (Cochrane gives ranges only); troponin cut-off to confirm.
+- 2026-11-26 (agreed with the user; applies to every later model without re-asking):
+  (a) repair target = relative pos/neg weight only (asym → 0 per test); overall over-reaction is a separate,
+      set-aside problem (see Goal);
+  (b) per-model split principle (practice = targets + one balanced control; held out = imaging target, lab
+      target, balanced control), first instance `repair_llama` (lipase becomes a target, CT kidney stone the
+      control). Why: the round-6 split encoded Qwen's pattern (lab = control); keeping the principle, not the
+      test list, is what keeps the logic the same across models;
+  (c) stage-2 order: blind 2B first (clean copy via `blind_setup.py`, brief `HANDOFF_blind_llama.md`,
+      100 score / 8000 probes), then the pre-registered Qwen comparison (`PLAN_crossmodel.md` §7), then the
+      hinted 2A recipe transfer. Why: a match found without the hint is evidence of shared structure.
+  Context: `results/diagnose/CROSSMODEL_batch1.md` §12 (the original-question asym is mostly the low-prior
+  side of the compression curve; mid-prior 2–95% band composition is nearly identical for Qwen and Llama,
+  so the pooled harness metric is comparable between them).

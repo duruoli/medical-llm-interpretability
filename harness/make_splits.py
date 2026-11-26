@@ -10,7 +10,11 @@ Suites (harness/config.py SUITES):
     test:     same test patients x seen tests/wordings (incl. lipase) + REPAIR_HELDOUT_WORDINGS
               + REPAIR_HELDOUT_TESTS
 
-Same seed -> same patient split in both suites. Only needs the pool file (histories are
+  repair_llama (per-model split, PIPELINE.md)
+    practice: as repair, plus ct_kidney_stone (balanced on Llama: the control); lipase is a target here
+    test:     as repair, minus ct_kidney_stone from the held-out tests (it is seen)
+
+Same seed -> same patient split in all suites. Only needs the pool file (histories are
 read back out of the prompts), so it can run on Quest directly:
   python -m harness.make_splits --suite repair
 """
