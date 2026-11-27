@@ -42,7 +42,12 @@ question, mid prior), before any repair:
 | model | suite | practice targets | practice control | held-out targets | held-out control |
 |---|---|---|---|---|---|
 | Qwen3.5-9B | `repair` | CT sigmoid, CT appendix | lipase (−0.41) | US appendix, CT kidney stone, US gallbladder | amylase (−0.22) |
-| Llama-3.1-8B | `repair_llama` | CT sigmoid +0.74, CT appendix +1.14, lipase +2.27 | CT kidney stone +0.08 | US appendix +2.22, amylase +1.32 | US gallbladder +0.10 |
+| Llama-3.1-8B | `repair_llama` | CT sigmoid +0.74, CT appendix +1.14 (lipase was listed here; see 2026-11-26 (e)) | CT kidney stone +0.08, lipase lexical −0.30 | US appendix +2.22 | US gallbladder +0.10, amylase lexical −0.33 |
+
+**Excluded cells (missing ability, reported separately, not in the |asym| target):** Qwen: appendix "9 mm"
+numeric. Llama: lab values written as "N U/L (reference a-b)" (lipase numeric / new_numeric, amylase numeric).
+Rule: a cell is excluded only if a direct test shows the model cannot make the needed judgement in the task's own
+wording; decided on practice data before any held-out scoring.
 
 The stage-1 gate's "DISCUSS: labs biased too" therefore no longer blocks a repair: it only means the
 lab test is a target, not the control, on that model.
@@ -173,6 +178,22 @@ and every version is reported.
   (c) stage-2 order: blind 2B first (clean copy via `blind_setup.py`, brief `HANDOFF_blind_llama.md`,
       100 score / 8000 probes), then the pre-registered Qwen comparison (`PLAN_crossmodel.md` §7), then the
       hinted 2A recipe transfer. Why: a match found without the hint is evidence of shared structure.
+  (d) blind-round condition = the BUDGET (score calls, probes), not wall-clock time. Llama session 1 was told
+      "about 2 h left" and declared a FINAL after 13/100 score calls (`results/weight_edit/llama_blind/`); that FINAL
+      is kept and labelled "session 1, time-prompted", not the main result. From session 2 on the agent is not told
+      about time; the human interrupts near the end of a GPU session and asks it to write the notebook.
+      Human guidance between sessions (e.g. "split the lipase/numeric failure into ability vs link") is logged
+      like round 6's "Update after Step 0"; it may not contain earlier-model findings.
+  (e) Llama session 2, S2-1 (agent diagnosis, human decision before held-out): lipase/numeric is a missing ability
+      in this wording. Asked "Serum lipase: v U/L (reference 13-60) — elevated/abnormal?", the model calls 8–45 U/L
+      elevated (it answers correctly with "normal range 13-60 U/L ... is this normal?"); internally v is a graded
+      pancreatitis-likeness with zero near 20 U/L; appending ", within normal limits" restores down −1.01 → +4.35.
+      So the number → "normal" conversion is missing, the label → negative-evidence path is intact. Decision: exclude
+      the numeric-reference lab cells from the target (practice: lipase/numeric; held out: lipase/new_numeric,
+      amylase/numeric), report them separately. Correction: Llama's "labs biased" (stage-1 DISCUSS) is entirely these
+      cells (diagnose, mid prior: lipase numeric +3.50, new_numeric +3.59, amylase numeric +2.97 vs lexical −0.30 /
+      −0.33; Qwen numeric −0.2…−0.5). Without them Llama has Qwen's pattern (imaging positive, labs balanced), and
+      lipase lexical becomes a second practice control. final_eval is summarised both with and without these cells.
   Context: `results/diagnose/CROSSMODEL_batch1.md` §12 (the original-question asym is mostly the low-prior
   side of the compression curve; mid-prior 2–95% band composition is nearly identical for Qwen and Llama,
   so the pooled harness metric is comparable between them).
