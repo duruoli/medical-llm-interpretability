@@ -13,6 +13,18 @@ Part B  causal test, "patient-mean patch": at the answer position, replace the c
   but can no longer depend on the patient. If it is an eraser, the pull (1 - slope) should FALL and the mean move
   should stay roughly the same. Conditions per patched component: whole component, its top-k erasers, k random
   units (control). Plus all top-k sets together.
+  RESULT (first run, biased 40-patient subset): did NOT lower the pull — with a result these units carry little patient
+  information anyway, so replacing it by the mean removes nothing.
+Part C  causal test, "add patient information back" (PLAN_attractor 3.1 step 2): on the RESULT prompt set the units to
+      (cell mean of the unit on the result prompt) + (this patient's no-result value - mean no-result value over the
+       cell's patients)
+  i.e. the unit keeps the average push it has with a result but varies over patients as it did without one. If the
+  pull is lost in these units (eraser), the pull should FALL while the mean move stays about the same. If the pull does
+  not change, the patient information was not lost there (it no longer reaches the answer by another route).
+  Conditions: addback_whole_<c>, addback_top_<c>, addback_rand_<c> (same number of random units), addback_top_all.
+Also --track m24:14331,...: per-patient raw value of single units on the no-result and every result prompt
+  (is the unit pushed into saturation?) -> track.json.
+Every summary reports pull (1 - slope) AND spread = SD(F)/SD(B) (< 1 compression, ~1 reordering).
 
   python -m harness.attractor_units --model meta-llama/Llama-3.1-8B-Instruct --out /projects/p53430/medllm/attractor/llama_units \
       --selection /projects/p53430/medllm/attractor/llama/selection.json --units m24,m29,m21,m28,a24 --patch m24,m29
@@ -56,6 +68,7 @@ class Units:
             y, n = R.yn
             wg = (W[y].float() - W[n].float()).to(dev) * g
         self.eps = float(getattr(norm, "variance_epsilon", getattr(norm, "eps", 1e-6)))
+        self.wg, self.prefix = wg, prefix
         self.cap, self.patch = {}, {}          # patch: comp -> (index tensor, value tensor) for the current prompt
         norm.register_forward_pre_hook(lambda m, a: self.cap.__setitem__("h_final", a[0][:, -1].detach().float()))
         self.mods, self.read, self.slices, self.n_units = {}, {}, {}, {}
@@ -139,6 +152,7 @@ def main():
     ap.add_argument("--k-neurons", type=int, default=32)
     ap.add_argument("--rank-side", default="N", choices=["N", "P", "both"], help="side used to rank top erasers")
     ap.add_argument("--pairs", type=int, default=3, help="wordings per test (0 = all)")
+    ap.add_argument("--track", default="", help="single units to record per patient, e.g. m24:14331,m21:13111")
     ap.add_argument("--pool", default="data/sigmoid_pool.jsonl")
     ap.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     ap.add_argument("--from-saved", action="store_true")
@@ -147,6 +161,9 @@ def main():
     out.mkdir(parents=True, exist_ok=True)
     comps = args.units.split(",")
     pcomps = args.patch.split(",")
+    track = [(x.split(":")[0], int(x.split(":")[1])) for x in args.track.split(",") if x]
+    assert all(c in comps for c, _ in track), "--track components must be in --units"
+    assert all(c in comps for c in pcomps), "--patch components must be in --units"
     sel = json.loads(Path(args.selection).read_text())
     apath = out / "unitsA.npz"
 
@@ -167,15 +184,21 @@ def main():
     if not apath.exists():
         t0 = time.time()
         mB, cB, rec = {t: [] for t in tests}, {t: {c: [] for c in comps} for t in tests}, {}
+        xB = {t: {c: [] for c in pcomps} for t in tests}          # per-patient no-result input (for part C)
+        tr = {f"{c}:{u}": {"B": {t: [] for t in tests}, "S": {"|".join(cell): [] for cell in cells}} for c, u in track}
         for cell in cells:
             rec[cell] = {"m": [], "c": {c: [] for c in comps}, "x": {c: None for c in pcomps}, "n": 0}
         for t in tests:
             for k, hid in enumerate(sel[t]):
                 T = by_id[hid]["tests"][t]
-                m, con, _ = U.run(tok(T["B"]))
+                m, con, xin = U.run(tok(T["B"]))
                 mB[t].append(m)
                 for c in comps:
                     cB[t][c].append(con[c].cpu().numpy().astype(np.float32))
+                for c in pcomps:
+                    xB[t][c].append(xin[c].cpu().numpy().astype(np.float32))
+                for c, u in track:
+                    tr[f"{c}:{u}"]["B"][t].append(float(xin[c][u]))
                 for w in pairs[t]:
                     for s in "PN":
                         m, con, xin = U.run(tok(T["pairs"][w][s]))
@@ -186,11 +209,17 @@ def main():
                         for c in pcomps:
                             v = xin[c].cpu().numpy().astype(np.float64)
                             r["x"][c] = v if r["x"][c] is None else r["x"][c] + v
+                        for c, u in track:
+                            tr[f"{c}:{u}"]["S"]["|".join((t, w, s))].append(float(xin[c][u]))
                         r["n"] += 1
             print(f"A {t}: {len(sel[t])} patients, {(time.time() - t0) / 60:.1f} min", flush=True)
+        if track:
+            (out / "track.json").write_text(json.dumps({"tracks": tr, "mB": mB, "sel": {t: sel[t] for t in tests}}))
         save = {}
         for t in tests:
             save[f"mB|{t}"] = np.array(mB[t])
+            for c in pcomps:
+                save[f"xB|{c}|{t}"] = np.stack(xB[t][c])
         for c in comps:
             sB = {t: vslope(mB[t], cB[t][c]) for t in tests}
             save[f"slopeB|{c}"] = np.stack([sB[t] for t, w, s in cells])
@@ -221,25 +250,37 @@ def main():
         conds[f"top_{c}"] = {c: top[c]}
         conds[f"rand_{c}"] = {c: top[f"rand_{c}"]}
     conds["top_all"] = {c: top[c] for c in pcomps}
-    base_s = {}
-    for i, (t, w, s) in enumerate(cells):
-        base_s[(t, w, s)] = A["mS"][i]
+    # part C: add patient information back (name prefix addback_)
+    for c in pcomps:
+        conds[f"addback_whole_{c}"] = {c: "all"}
+        conds[f"addback_top_{c}"] = {c: top[c]}
+        conds[f"addback_rand_{c}"] = {c: top[f"rand_{c}"]}
+    conds["addback_top_all"] = {c: top[c] for c in pcomps}
     for name, spec in conds.items():
         pth = out / f"patch_{name}.json"
         if pth.exists() or args.from_saved:
             continue
+        addback = name.startswith("addback_")
         t0 = time.time()
         res = {}
         for i, (t, w, s) in enumerate(cells):
+            idxs = {c: torch.arange(U.mods[c].in_features) if units == "all" else U.expand(c, units)
+                    for c, units in spec.items()}
+            mean_S = {c: torch.as_tensor(A[f"xmean|{c}"][i]).float() for c in spec}
+            if addback:
+                XB = {c: torch.as_tensor(A[f"xB|{c}|{t}"]).float() for c in spec}
+                devB = {c: XB[c] - XB[c].mean(0) for c in spec}       # patient's no-result deviation
+            ms = []
+            for k, hid in enumerate(sel[t]):
+                U.patch = {}
+                for c in spec:
+                    v = mean_S[c] + devB[c][k] if addback else mean_S[c]
+                    U.patch[c] = (idxs[c].to(R.device), v[idxs[c]].to(R.device))
+                ms.append(U.run(tok(by_id[hid]["tests"][t]["pairs"][w][s]))[0])
             U.patch = {}
-            for c, units in spec.items():
-                idx = torch.arange(U.mods[c].in_features) if units == "all" else U.expand(c, units)
-                val = torch.as_tensor(A[f"xmean|{c}"][i])[idx]
-                U.patch[c] = (idx.to(R.device), val.to(R.device))
-            res["|".join((t, w, s))] = [U.run(tok(by_id[hid]["tests"][t]["pairs"][w][s]))[0] for hid in sel[t]]
-            U.patch = {}
+            res["|".join((t, w, s))] = ms
         pth.write_text(json.dumps({"spec": {c: v for c, v in spec.items()}, "margins": res}))
-        print(f"B {name}: {(time.time() - t0) / 60:.1f} min", flush=True)
+        print(f"{'C' if addback else 'B'} {name}: {(time.time() - t0) / 60:.1f} min", flush=True)
 
     # ---------------- report
     L = [f"# Attractor units: {args.model}", "",
@@ -260,10 +301,13 @@ def main():
         topk = np.argsort(np.median(delta[c][rank_mask], 0))[:k]
         L += ["", f"component total delta (median): N {tot[0]:+.3f}, P {tot[1]:+.3f}; top-{k} share: "
                   f"N {np.median(delta[c][side == 'N'][:, topk].sum(1)):+.3f}, P {np.median(delta[c][side == 'P'][:, topk].sum(1)):+.3f}", ""]
-    L += ["## B. Patient-mean patch at the answer position (causal)", "",
-          "pull = 1 − slope(final margin on B); move = mean(P − B) or mean(B − N). Eraser removed → pull falls, move about the same. "
-          "rand_* = same number of random units of that component (control).", "",
-          "| condition | N pull | N move | P pull | P move | N pull imaging | N pull lab |", "|---|---|---|---|---|---|---|"]
+    L += ["## B/C. Patches at the answer position (causal)", "",
+          "pull = 1 − slope(final margin on B); spread = SD(final)/SD(B); move = mean(P − B) or mean(B − N). "
+          "B (no prefix): patient-mean patch. C (addback_*): patient's no-result deviation added back on top of the "
+          "result-prompt mean — if the pull is lost in these units, pull falls and move stays about the same. "
+          "rand = same number of random units of that component (control).", "",
+          "| condition | N pull | N spread | N move | P pull | P spread | P move | N pull imaging | N pull lab |",
+          "|---|---|---|---|---|---|---|---|---|"]
 
     def summarise(margs):
         rows = {"N": [], "P": []}
@@ -271,10 +315,10 @@ def main():
             mb = A[f"mB|{t}"]
             ms = np.array(margs[i])
             mv = (ms - mb).mean() if s == "P" else (mb - ms).mean()
-            rows[s].append((1 - slope(mb, ms), mv, t in IMG))
+            rows[s].append((1 - slope(mb, ms), mv, t in IMG, ms.std() / mb.std()))
         f = lambda s, j: np.median([r[j] for r in rows[s]])
         fi = lambda s, img: np.median([r[0] for r in rows[s] if r[2] == img]) if any(r[2] == img for r in rows[s]) else float("nan")
-        return f("N", 0), f("N", 1), f("P", 0), f("P", 1), fi("N", True), fi("N", False)
+        return f("N", 0), f("N", 3), f("N", 1), f("P", 0), f("P", 3), f("P", 1), fi("N", True), fi("N", False)
 
     allres = {"base": summarise([list(A["mS"][i]) for i in range(len(cells))])}
     for name in conds:
@@ -283,8 +327,23 @@ def main():
             mg = json.loads(pth.read_text())["margins"]
             allres[name] = summarise([mg["|".join(cell)] for cell in cells])
     for name, r in allres.items():
-        L.append(f"| {name} | {r[0]:.2f} | {r[1]:.2f} | {r[2]:.2f} | {r[3]:.2f} | {r[4]:.2f} | {r[5]:.2f} |")
+        L.append("| " + name + " | " + " | ".join(f"{x:.2f}" for x in r) + " |")
     L += ["", "Top units used: " + "; ".join(f"{c}: {top[c]}" for c in pcomps), ""]
+    tp = out / "track.json"
+    if tp.exists():
+        T = json.loads(tp.read_text())
+        L += ["## D. Tracked units (raw value into the output projection)", "",
+              "slope = unit value on B across patients; p5/p50/p95 over patients (median over cells).", "",
+              "| unit | prompt | p5 | p50 | p95 | slope on B |", "|---|---|---|---|---|---|"]
+        for key, d in T["tracks"].items():
+            rowsB = [(np.percentile(v, [5, 50, 95]), slope(T["mB"][t], v)) for t, v in d["B"].items() if v]
+            for lab, sd in (("no result", None), ("result N", "N"), ("result P", "P")):
+                rr = rowsB if sd is None else \
+                    [(np.percentile(v, [5, 50, 95]), slope(T["mB"][c.split("|")[0]], v))
+                     for c, v in d["S"].items() if v and c.endswith("|" + sd)]
+                q = np.median(np.array([r[0] for r in rr]), 0); sl = np.median([r[1] for r in rr])
+                L.append(f"| {key} | {lab} | {q[0]:+.2f} | {q[1]:+.2f} | {q[2]:+.2f} | {sl:+.3f} |")
+        L.append("")
     (out / "REPORT.md").write_text("\n".join(L) + "\n")
     (out / "report.json").write_text(json.dumps({"top": top, "summary": allres}, default=float))
     print("\n".join(L))

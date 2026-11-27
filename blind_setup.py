@@ -28,13 +28,28 @@ from harness.config import SUITES
 
 # names harness/core.py and harness/server.py import from config (+ what arm_check / lit_moves use)
 KEEP = {"lit_moves", "PB_RANGE", "DOWN_FLOOR", "FORBIDDEN", "MAX_NNZ", "BUDGET", "MAX_PROBE_PER_CALL",
-        "GENERAL_YESNO", "GENERAL_SUFFIX", "NLL_TEXTS", "NLL_MAX_TOKENS", "arm_check"}
+        "GENERAL_YESNO", "GENERAL_SUFFIX", "NLL_TEXTS", "NLL_MAX_TOKENS", "arm_check", "ATTRACTOR"}
+# written separately, trimmed (no held-out test names, only the round's profile)
+TRIMMED = {"BUDGET", "ATTRACTOR_PROFILES", "TEST_DISEASE"}
 LEAK = re.compile(r"Qwen|DeltaNet|linear_attn|27\.1[0-3]|31\.5|\bdV\b|\bC3\b|\bround[ -]?[1-6]\b|HANDOFF_|"
                   r"B_translate|A_readout|ridge|N_off|P_off", re.I)
+# attractor rounds are INFORMED (the brief carries the manual attractor findings, model names included). What must
+# not leak there: the earlier asym-repair rounds, and anything naming the held-out data (tests, wordings, domain).
+LEAK_ASYM_ROUNDS = r"\bdV\b|\bC3\b|\bround[ -]?[1-6]\b|HANDOFF_|B_translate|A_readout|ridge|N_off|P_off|31\.5"
+
+
+def attractor_leak(suite):
+    import harness.config as C
+    names = set(suite["heldout_tests"]) | {w for ws in suite["heldout_wordings"].values() for w in ws}
+    names |= {t for t in C.TEST_DISEASE if t not in suite["heldout_tests"]} - set(
+        json.loads(Path(suite["practice"]).open().readline())["tests"])   # other-domain tests
+    words = sorted(names) + ["harness_test", "echo_pool", "final_eval", "diagnose_echo"]
+    return re.compile(LEAK_ASYM_ROUNDS + "|" + "|".join(rf"\b{re.escape(w)}\b" for w in words), re.I)
 NEUTRAL_DOC = {
     "core.py": '"""Model wrapper, weight editing with rollback, diagnostic interventions, scoring and guards."""\n',
     "server.py": '"""GPU service: holds the model, enforces the rules and the budget. See HANDOFF.md."""\n',
     "client.py": '"""Command-line client for harness.server. See HANDOFF.md."""\n',
+    "attractor_score.py": '"""Pull / move / remainder scoring of the current model on the practice split. See HANDOFF.md."""\n',
 }
 
 
@@ -48,7 +63,7 @@ def strip_docstring(src, new_doc):
     return new_doc + src
 
 
-def build_config(practice_tests, n_layers, budget):
+def build_config(practice_tests, n_layers, budget, profile=None):
     src = Path("harness/config.py").read_text()
     tree = ast.parse(src)
     body = []
@@ -60,8 +75,8 @@ def build_config(practice_tests, n_layers, budget):
                          if not (isinstance(s, ast.Expr) and isinstance(getattr(s, "value", None), ast.Constant))]
             body.append(node)
         elif isinstance(node, ast.Assign) and any(isinstance(t, ast.Name) and t.id in KEEP for t in node.targets):
-            if any(t.id == "BUDGET" for t in node.targets if isinstance(t, ast.Name)):
-                continue                       # written below from --score-calls / --probe-prompts
+            if any(t.id in TRIMMED for t in node.targets if isinstance(t, ast.Name)):
+                continue                       # written below, trimmed
             body.append(node)
     out = ['"""Fixed settings of the harness (yardsticks, rules, budget). Read-only for the researcher."""']
     out += [ast.unparse(n) for n in body]
@@ -69,6 +84,11 @@ def build_config(practice_tests, n_layers, budget):
     lit = {t: C.LIT[t] for t in practice_tests}
     out.append(f"LIT = {lit!r}")
     out.append(f"BUDGET = {budget!r}")
+    if profile:
+        prof = dict(C.ATTRACTOR_PROFILES[profile])
+        prof["exclude_tests"] = [t for t in prof.get("exclude_tests") or [] if t in practice_tests]
+        out.append(f"ATTRACTOR_PROFILES = {{{profile!r}: {prof!r}}}")
+        out.append(f"TEST_DISEASE = {({t: C.TEST_DISEASE.get(t) for t in practice_tests})!r}")
     out.append(f"ARMS = {{'free': {{'layers': range(0, {n_layers}), 'modules': ('self_attn', 'mlp')}}}}")
     out.append("ARM_PARAM = re.compile('layers\\\\.(\\\\d+)\\\\.(self_attn|mlp)\\\\.')")
     return "\n\n".join(out) + "\n"
@@ -83,6 +103,9 @@ def main():
     ap.add_argument("--n-layers", type=int, default=32)
     ap.add_argument("--score-calls", type=int, default=100)
     ap.add_argument("--probe-prompts", type=int, default=8000)
+    ap.add_argument("--target", default="asym", choices=["asym", "attractor"],
+                    help="attractor: server scores pull (needs --profile); copies harness/attractor_score.py")
+    ap.add_argument("--profile", default=None, help="attractor profile (config.ATTRACTOR_PROFILES), e.g. llama")
     ap.add_argument("--deny", nargs="*", default=["/home/dlf8982/AAA", "/scratch/dlf8982",
                                                   "/projects/p53430/medllm/harness*",
                                                   "/projects/p53430/medllm/diagnose"],
@@ -104,15 +127,26 @@ def main():
     (repo / ".claude").mkdir()
     (dest / "out").mkdir(exist_ok=True)
 
+    if args.target == "attractor" and not args.profile:
+        sys.exit("--target attractor needs --profile")
     (repo / "harness" / "__init__.py").write_text("")
-    for f in ("core.py", "server.py", "client.py"):
+    files = ("core.py", "server.py", "client.py") + (("attractor_score.py",) if args.target == "attractor" else ())
+    for f in files:
         src = Path("harness", f).read_text()
         src = strip_docstring(src, NEUTRAL_DOC[f])
         src = src.replace('default="Qwen/Qwen3.5-9B"', f'default="{args.model}"')
         src = src.replace('Path("/scratch/dlf8982/harness")', f'Path("{dest / "out"}")')
         src = src.replace('default="/projects/p53430/medllm/harness"', f'default="{dest / "out"}"')
+        if f == "server.py" and args.target == "attractor":
+            src = src.replace('ap.add_argument("--target", default="asym"', 'ap.add_argument("--target", default="attractor"')
+            src = src.replace('ap.add_argument("--profile", default="llama"', f'ap.add_argument("--profile", default="{args.profile}"')
         (repo / "harness" / f).write_text(src)
-    (repo / "harness" / "config.py").write_text(build_config(tests, args.n_layers, {"score_calls": args.score_calls, "probe_prompts": args.probe_prompts}))
+    if args.target == "asym":   # the asym copy never imports the attractor scorer
+        sp = repo / "harness" / "server.py"
+        sp.write_text(sp.read_text().replace("from harness.attractor_score import attractor_report\n", ""))
+    (repo / "harness" / "config.py").write_text(build_config(
+        tests, args.n_layers, {"score_calls": args.score_calls, "probe_prompts": args.probe_prompts},
+        args.profile if args.target == "attractor" else None))
     shutil.copy(practice, repo / "data" / "harness" / "practice.jsonl")
     shutil.copy(args.brief, repo / "HANDOFF.md")
 
@@ -123,11 +157,12 @@ def main():
     (repo / ".claude" / "settings.json").write_text(json.dumps({"permissions": {"deny": deny}}, indent=1))
 
     # leak check on everything the agent can read in the copy (the practice data is MIMIC text, skipped)
+    leak = attractor_leak(suite) if args.target == "attractor" else LEAK
     hits = []
     for p in repo.rglob("*"):
         if p.is_file() and p.suffix in (".py", ".md", ".json") and p.name != "settings.json":
             for i, line in enumerate(p.read_text().splitlines(), 1):
-                if LEAK.search(line):
+                if leak.search(line):
                     hits.append(f"{p.relative_to(repo)}:{i}: {line.strip()[:120]}")
     if hits:
         print("LEAK CHECK FAILED (fix the brief or this script, delete the copy, rerun):")

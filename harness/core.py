@@ -8,6 +8,13 @@ Diagnostic interventions (forward hooks, no weight change, removable) -- see Mod
   ablate_heads   attention heads of a full-attention layer L scaled by (1 - scale) (input of o_proj)
   freeze         listed modules output what they output on the ORIGINAL model (no weight edit, no
                  interventions) for the same prompt -> tests self-repair / compensation.
+  patch_units    at the answer position, set chosen units (MLP neurons = input of down_proj, or attention heads =
+                 input of o_proj / out_proj) to  value on the SOURCE prompt + offset[cell].  Source = the same
+                 patient's no-result (B) prompt; offset per "test|pair|side" (server can fill it as the mean over
+                 mid cases of value(result prompt) - value(B prompt)  ->  "add the patient information back").
+                 Prompts without a source (B prompts, general questions, NLL texts) are left untouched.
+Attribution (Model.attrib): direct contribution of every block (embedding, each attention, each MLP) to the
+yes-no margin at the answer position, final norm linearised per prompt; optionally per unit of chosen blocks.
 """
 import json
 import math
@@ -24,6 +31,11 @@ from harness.config import (DOWN_FLOOR, FORBIDDEN, GENERAL_SUFFIX, GENERAL_YESNO
 def chat(tok, text):
     return tok.apply_chat_template([{"role": "user", "content": text}], tokenize=False,
                                    add_generation_prompt=True, enable_thinking=False)
+
+
+def attn_child(layer):
+    """Name of a decoder layer's attention (token-mixing) sub-module."""
+    return next(n for n, _ in layer.named_children() if "attn" in n or n == "mixer")
 
 
 def load_items(path, limit=0):
@@ -49,8 +61,51 @@ class Model:
         self.layers_prefix = next(n[:-2] for n, _ in self.hf.named_modules() if re.fullmatch(r".*\.layers\.0", n))
         self.cfg = getattr(self.hf.config, "text_config", self.hf.config)
         self.iv_specs, self.freeze_mods, self._iv_hooks = [], [], []
-        self._mode = "on"       # "on" | "capture_patch" | "capture_freeze"
+        self._mode = "on"       # "on" | "capture_patch" | "capture_freeze" | "capture_units"
         self._patch_src, self._freeze_src = {}, {}
+        self._unit_src, self._unit_key = {}, None     # patch_units: captured source values, current cell key
+
+    # ---- unit addressing (MLP neurons / attention heads) -------------------------------
+    def unit_module(self, layer, kind):
+        """Module whose INPUT holds the units: mlp.down_proj (neurons) or the attention output projection
+        (heads). Returns (name, module, features per unit)."""
+        if kind == "mlp":
+            name = self.layer_module(layer, "mlp.down_proj")
+            return name, self.hf.get_submodule(name), 1
+        layer_mod = self.hf.get_submodule(self.layer_module(layer))
+        att_name = attn_child(layer_mod)
+        att = getattr(layer_mod, att_name)
+        proj = next(s for s in ("o_proj", "out_proj") if hasattr(att, s))
+        mod = getattr(att, proj)
+        hd = (getattr(att, "head_v_dim", None) or getattr(att, "head_dim", None) or getattr(self.cfg, "head_dim", None)
+              or self.cfg.hidden_size // self.cfg.num_attention_heads)
+        return self.layer_module(layer, f"{att_name}.{proj}"), mod, hd
+
+    def unit_index(self, layer, kind, units):
+        name, mod, hd = self.unit_module(layer, kind)
+        if units == "all":
+            return name, mod, torch.arange(mod.in_features)
+        return name, mod, torch.as_tensor([u * hd + j for u in units for j in range(hd)], dtype=torch.long)
+
+    def has_unit_patch(self):
+        return any(s["type"] == "patch_units" for s in self.iv_specs)
+
+    def _units_hook(self, k, s):
+        idx = s["_idx"].to(self.device)
+
+        def pre(mod, args):
+            if self._mode == "capture_units":
+                self._unit_src[k] = args[0][0, -1, idx].detach().float().clone()
+                return None
+            if self._mode != "on" or self._unit_key is None or k not in self._unit_src:
+                return None
+            off = s["_off"].get(self._unit_key)
+            if off is None:
+                return None
+            x = args[0].clone()
+            x[0, -1, idx] = (self._unit_src[k] + off.to(self.device)).to(x.dtype)
+            return (x,) + tuple(args[1:])
+        return pre
 
     # ---- interventions -------------------------------------------------------------
     def layer_module(self, layer, sub=""):
@@ -125,6 +180,7 @@ class Model:
             h.remove()
         self.iv_specs, self.freeze_mods, self._iv_hooks = [], [], []
         self._patch_src, self._freeze_src = {}, {}
+        self._unit_src, self._unit_key = {}, None
 
     def set_interventions(self, specs, freeze=()):
         """Replace any active interventions. Returns one description line per spec."""
@@ -164,6 +220,28 @@ class Model:
                     self._iv_hooks.append(mod.register_forward_pre_hook(
                         self._ablate_hook(idx, s.get("scale", 1.0))))
                     desc.append(f"ablate heads {s['heads']} of layer {s['layer']} x{s.get('scale', 1.0)} (head_dim {hd})")
+                elif t == "patch_units":
+                    kind = s.get("kind", "mlp")
+                    if kind not in ("mlp", "heads"):
+                        raise ValueError("patch_units kind must be 'mlp' or 'heads'")
+                    name, mod, idx = self.unit_index(s["layer"], kind, s["units"])
+                    s["_idx"] = idx
+                    offs = s.get("offsets") or {}
+                    if isinstance(offs, str):
+                        offs = torch.load(offs, map_location="cpu", weights_only=False)
+                    s["_off"] = {}
+                    for key, v in offs.items():
+                        v = torch.as_tensor(v, dtype=torch.float32).flatten()
+                        if v.numel() != len(idx):
+                            raise ValueError(f"patch_units offset {key}: {v.numel()} values, expected {len(idx)}")
+                        s["_off"][key] = v
+                    if not s["_off"]:
+                        raise ValueError("patch_units needs offsets (or 'auto' on the server): "
+                                         "{'test|pair|side': [values per feature]}")
+                    self._iv_hooks.append(mod.register_forward_pre_hook(self._units_hook(k, s)))
+                    nu = "all" if s["units"] == "all" else len(s["units"])
+                    desc.append(f"patch_units {kind} layer {s['layer']} ({name}): {nu} units, {len(idx)} features, "
+                                f"source = same patient's B prompt, offsets for {len(s['_off'])} cells")
                 else:
                     raise ValueError(f"unknown intervention type {t!r}")
                 self.iv_specs.append(s)
@@ -183,14 +261,20 @@ class Model:
             self.params[n].data.copy_((self.orig[n] if to_original else self.edited[n]).to(self.device))
 
     @torch.no_grad()
-    def _forward(self, x, patch_ids=None, **kw):
-        """One forward pass with the active interventions (plus freeze / patch source runs)."""
+    def _forward(self, x, patch_ids=None, unit_ctx=None, **kw):
+        """One forward pass with the active interventions (plus freeze / patch / patch_units source runs).
+        unit_ctx = (source ids, cell key) for patch_units; None -> patch_units leave this prompt alone."""
         try:
+            self._unit_key, self._unit_src = None, {}
             if any(s["type"] == "patch" for s in self.iv_specs):
                 if patch_ids is None:
                     raise ValueError("a patch intervention is active: every prompt needs 'patch_from'")
                 self._mode = "capture_patch"
                 self.hf(torch.tensor([patch_ids], device=self.device), logits_to_keep=1)
+            if unit_ctx is not None and self.has_unit_patch():
+                self._mode = "capture_units"
+                self.hf(torch.tensor([unit_ctx[0]], device=self.device), logits_to_keep=1)
+                self._unit_key = unit_ctx[1]
             if self.freeze_mods:
                 self._mode = "capture_freeze"
                 self._swap(True)
@@ -202,6 +286,7 @@ class Model:
             return self.hf(x, **kw)
         finally:
             self._mode = "on"
+            self._unit_key = None
 
     # ---- forward passes ------------------------------------------------------------
     def ids(self, text, raw=False):
@@ -212,9 +297,9 @@ class Model:
         return self._ids[key]
 
     @torch.no_grad()
-    def yesno(self, ids, patch_ids=None):
+    def yesno(self, ids, patch_ids=None, unit_ctx=None):
         x = torch.tensor([ids], device=self.device)
-        lg = self._forward(x, patch_ids, logits_to_keep=1).logits[0, -1].float()
+        lg = self._forward(x, patch_ids, unit_ctx, logits_to_keep=1).logits[0, -1].float()
         p = torch.softmax(lg, -1)
         y, n = self.yn
         return {"m": (lg[y] - lg[n]).item(), "mass": (p[y] + p[n]).item(), "logits": lg}
@@ -227,6 +312,76 @@ class Model:
             return float("nan")   # patching needs a per-prompt source; not defined for plain text
         lg = self._forward(x).logits[0, :-1].float()
         return torch.nn.functional.cross_entropy(lg, x[0, 1:]).item()
+
+    @torch.no_grad()
+    def capture_inputs(self, ids, targets):
+        """targets: [(layer, kind, units)]. Plain forward (call with no interventions installed); returns the
+        answer-position input values of those units, one float32 CPU tensor per target."""
+        got, hooks = {}, []
+        for j, (layer, kind, units) in enumerate(targets):
+            _, mod, idx = self.unit_index(layer, kind, units)
+            idx = idx.to(self.device)
+            hooks.append(mod.register_forward_pre_hook(
+                lambda m, a, j=j, idx=idx: got.__setitem__(j, a[0][0, -1, idx].detach().float().cpu())))
+        try:
+            self.hf(torch.tensor([ids], device=self.device), logits_to_keep=1)
+        finally:
+            for h in hooks:
+                h.remove()
+        return [got[j] for j in range(len(targets))]
+
+    def _attrib_setup(self):
+        if getattr(self, "_attr", None) is not None:
+            return self._attr
+        base = self.hf.get_submodule(self.layers_prefix.rsplit(".", 1)[0])
+        norm, embed = base.norm, base.embed_tokens
+        dev = next(norm.parameters()).device
+        d = self.cfg.hidden_size
+        with torch.no_grad():
+            g = norm(torch.ones(1, 1, d, device=dev, dtype=next(norm.parameters()).dtype))[0, 0].float()
+            W = self.hf.get_output_embeddings().weight
+            y, n = self.yn
+            wg = (W[y].float() - W[n].float()).to(dev) * g
+        blocks = [("embed", embed)]
+        for L in range(self.cfg.num_hidden_layers):
+            layer = self.hf.get_submodule(self.layer_module(L))
+            blocks += [(f"a{L}", getattr(layer, attn_child(layer))), (f"m{L}", layer.mlp)]
+        eps = float(getattr(norm, "variance_epsilon", getattr(norm, "eps", 1e-6)))
+        self._attr = {"norm": norm, "blocks": blocks, "wg": wg, "eps": eps}
+        return self._attr
+
+    @torch.no_grad()
+    def attrib(self, ids, units=(), unit_ctx=None, patch_ids=None):
+        """Direct contribution of each block to the margin at the answer position (with active edit and
+        interventions). units: block names ("m24", "a27") to split per neuron / head. Returns dict."""
+        S = self._attrib_setup()
+        cap, hooks = {}, []
+        for name, mod in S["blocks"]:
+            hooks.append(mod.register_forward_hook(
+                lambda m, a, o, name=name: cap.__setitem__(name, (o[0] if isinstance(o, tuple) else o)[0, -1].detach().float())))
+        hooks.append(S["norm"].register_forward_pre_hook(lambda m, a: cap.__setitem__("h_final", a[0][0, -1].detach().float())))
+        uin = {}
+        for u in units:
+            kind = "mlp" if u[0] == "m" else "heads"
+            _, mod, hd = self.unit_module(int(u[1:]), kind)
+            hooks.append(mod.register_forward_pre_hook(
+                lambda m, a, u=u: uin.__setitem__(u, a[0][0, -1].detach().float())))
+        try:
+            m = self.yesno(ids, patch_ids, unit_ctx)["m"]
+        finally:
+            for h in hooks:
+                h.remove()
+        h = cap["h_final"]
+        rms = torch.sqrt((h * h).mean() + S["eps"])
+        contrib = {name: float((cap[name] * S["wg"]).sum() / rms) for name, _ in S["blocks"]}
+        out = {"m": m, "blocks": contrib, "decomp_err": abs(sum(contrib.values()) - m), "rms": float(rms), "units": {}}
+        for u in units:
+            kind = "mlp" if u[0] == "m" else "heads"
+            _, mod, hd = self.unit_module(int(u[1:]), kind)
+            read = mod.weight.float().t() @ S["wg"]                # (in_features,)
+            per = uin[u] * read / rms
+            out["units"][u] = (per if kind == "mlp" else per.view(-1, hd).sum(-1)).cpu()
+        return out
 
     # ---- editing ---------------------------------------------------------------------
     def original(self, name):
@@ -296,14 +451,17 @@ def random_control(deltas, seed=0):
 def run_items(model, items):
     """margins[i][test] = {"B": m, "mass_B": .., pair: {"P": m, "N": m}}"""
     out = []
+    units = model.has_unit_patch()      # patch_units: source = the same patient's B prompt
     for it in items:
         row = {}
         for test, t in it["tests"].items():
-            b = model.yesno(model.ids(t["B"]))
+            bids = model.ids(t["B"])
+            b = model.yesno(bids)
             r = {"B": b["m"], "mass_B": b["mass"]}
             for pair, pr in t["pairs"].items():
-                r[pair] = {"P": model.yesno(model.ids(pr["P"]))["m"],
-                           "N": model.yesno(model.ids(pr["N"]))["m"]}
+                ctx = lambda s: (bids, f"{test}|{pair}|{s}") if units else None
+                r[pair] = {"P": model.yesno(model.ids(pr["P"]), unit_ctx=ctx("P"))["m"],
+                           "N": model.yesno(model.ids(pr["N"]), unit_ctx=ctx("N"))["m"]}
             row[test] = r
         out.append(row)
     return out

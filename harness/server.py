@@ -16,8 +16,13 @@ Endpoints (POST, JSON):
   acts    {prompts, modules, positions, kind}  save activations to a .pt file    [probe_prompts]
   weights {names}             save ORIGINAL weights to a .pt file (free; analysis is CPU-side)
   intervene {interventions, freeze}   install DIAGNOSTIC hooks (no weight change; free); they stay on for
-                              every later score / logits / acts call until `clear` or the next `intervene`
+                              every later score / logits / acts call until `clear` or the next `intervene`.
+                              patch_units with "offsets": "auto" -> the server computes them on the practice
+                              mid cases (charged to probe_prompts)
   clear                       remove all interventions (free)
+  attrib  {prompts, units}    direct contribution of every block (+ units of chosen blocks) -> .pt [probe_prompts]
+--target attractor (with --profile llama|qwen): `score` reports pull / move / r (harness/attractor_score.py)
+instead of asym.
 A prompt is {"case": i, "test": t, "variant": "B"} or {..., "pair": p, "variant": "P"|"N"}
 (index into practice.jsonl) or {"text": "...", "raw": false} (chat template unless raw).
 With a `patch` intervention active, each prompt also needs "patch_from": <another prompt>.
@@ -34,6 +39,7 @@ from pathlib import Path
 
 import torch
 
+from harness.attractor_score import attractor_report
 from harness.config import BUDGET, MAX_PROBE_PER_CALL
 from harness.core import Model, load_edit, load_items, mid_cases, report, run_guards, run_items
 
@@ -41,6 +47,7 @@ from harness.core import Model, load_edit, load_items, mid_cases, report, run_gu
 class State:
     def __init__(self, args):
         self.out = Path(args.out)
+        self.target, self.profile = args.target, args.profile
         for d in ("edits", "acts", "weights", "scores"):
             (self.out / d).mkdir(parents=True, exist_ok=True)
         self.log_path = self.out / "log.jsonl"
@@ -61,11 +68,16 @@ class State:
         self.ref = run_items(self.model, self.items)
         self.g_ref = run_guards(self.model, self.items)
         self.mid = mid_cases(self.ref, self.items)
-        rep, text = report(self.ref, self.ref, self.g_ref, self.g_ref, self.items, self.mid)
+        rep, text = self.report(self.ref, self.g_ref)
         (self.out / "scores" / "original.txt").write_text(text)
         self.log({"cmd": "start", "model": args.model, "secs": round(time.time() - t0),
                   "mid": {k: len(v) for k, v in self.mid.items()}, "headline": rep["headline"]})
         print(text, flush=True)
+
+    def report(self, cur, g):
+        if self.target == "attractor":
+            return attractor_report(cur, self.ref, g, self.g_ref, self.items, self.mid, self.profile)
+        return report(cur, self.ref, g, self.g_ref, self.items, self.mid)
 
     def write_info(self, name):
         m = self.model
@@ -106,7 +118,7 @@ class State:
         t0 = time.time()
         cur = run_items(self.model, self.items)
         g = run_guards(self.model, self.items)
-        rep, text = report(cur, self.ref, g, self.g_ref, self.items, self.mid)
+        rep, text = self.report(cur, g)
         tag = f"{self.used['score_calls']:03d}"
         (self.out / "scores" / f"{tag}.txt").write_text(
             f"edit: {self.active}\ninterventions: {self.iv}\n\n{text}")
@@ -116,12 +128,46 @@ class State:
         return {"text": f"[score {tag}, edit {self.active}, interventions {self.iv}, {time.time() - t0:.0f}s, "
                         f"budget left {self.budget_left()}]\n{text}"}
 
+    def auto_offsets(self, specs):
+        """patch_units with offsets "auto": per cell, mean over the practice mid cases of
+        value(result prompt) - value(B prompt), at the current weights, no interventions.
+        Then value = B value + offset = (cell mean with result) + (patient's no-result deviation from its mean)."""
+        auto = [s for s in specs if s.get("type") == "patch_units" and s.get("offsets") == "auto"]
+        if not auto:
+            return 0
+        targets = [(s["layer"], s.get("kind", "mlp"), s["units"]) for s in auto]
+        tests = self.items[0]["tests"]
+        n = sum(len(self.mid[t]) * (1 + 2 * len(tests[t]["pairs"])) for t in tests)
+        self.spend("probe_prompts", n)
+        self.model.clear_interventions()
+        self.iv = None
+        sums = [dict() for _ in auto]
+        for t in tests:
+            for i in self.mid[t]:
+                T = self.items[i]["tests"][t]
+                vb = self.model.capture_inputs(self.model.ids(T["B"]), targets)
+                for pair, pr in T["pairs"].items():
+                    for side in "PN":
+                        vs = self.model.capture_inputs(self.model.ids(pr[side]), targets)
+                        key = f"{t}|{pair}|{side}"
+                        for j in range(len(auto)):
+                            d = vs[j] - vb[j]
+                            sums[j][key] = sums[j][key] + d if key in sums[j] else d
+        for j, s in enumerate(auto):
+            s["offsets"] = {k: (v / len(self.mid[k.split("|")[0]])).tolist() for k, v in sums[j].items()}
+        return n
+
     def cmd_intervene(self, req):
-        desc = self.model.set_interventions(req.get("interventions", []), req.get("freeze", []))
+        specs = [dict(s) for s in req.get("interventions", [])]
+        n_auto = self.auto_offsets(specs)
+        desc = self.model.set_interventions(specs, req.get("freeze", []))
         self.iv = desc or None
-        self.log({"cmd": "intervene", "spec": req})
+        self.log({"cmd": "intervene", "spec": {**req, "interventions": [
+            {k: (v if k != "offsets" else f"<{len(v)} cells>") for k, v in s.items()} for s in specs]},
+            "auto_offset_prompts": n_auto})
+        extra = f"\n  (auto offsets: {n_auto} probe prompts charged)" if n_auto else ""
         return {"text": "interventions active (diagnostic only, weights unchanged):\n" +
-                        "\n".join(f"  {d}" for d in desc)}
+                        "\n".join(f"  {d}" for d in desc) + extra}
 
     def cmd_clear(self, req):
         self.model.clear_interventions()
@@ -163,15 +209,22 @@ class State:
         src = [self.prompt_ids(p["patch_from"]) if "patch_from" in p else None for p in prompts]
         if any(s["type"] == "patch" for s in self.model.iv_specs) and None in src:
             raise ValueError("a patch intervention is active: every prompt needs 'patch_from' (nothing charged)")
-        self.spend("probe_prompts", len(prompts) + sum(s is not None for s in src))
-        return prompts, list(zip(ids, src))
+        # patch_units: result prompts of practice cases take the same patient's B prompt as source
+        ctx = [None] * len(prompts)
+        if self.model.has_unit_patch():
+            for j, p in enumerate(prompts):
+                if "case" in p and p.get("variant") in ("P", "N"):
+                    b = self.prompt_ids({"case": p["case"], "test": p["test"], "variant": "B"})
+                    ctx[j] = (b, f"{p['test']}|{p['pair']}|{p['variant']}")
+        self.spend("probe_prompts", len(prompts) + sum(s is not None for s in src) + sum(c is not None for c in ctx))
+        return prompts, [(x, s, c) for x, s, c in zip(ids, src, ctx)]
 
     def cmd_logits(self, req):
         prompts, ids = self._probe(req)
         k = int(req.get("top_k", 5))
         rows = []
-        for p, (x, s) in zip(prompts, ids):
-            r = self.model.yesno(x, s)
+        for p, (x, s, c) in zip(prompts, ids):
+            r = self.model.yesno(x, s, c)
             top = torch.topk(torch.softmax(r["logits"], -1), k)
             rows.append({"prompt": p, "yes_minus_no": round(r["m"], 3), "yesno_mass": round(r["mass"], 3),
                          "top": [(self.model.tok.decode([int(i)]), round(float(v), 3))
@@ -200,9 +253,9 @@ class State:
         acts = {m: [] for m in mods}
         margins, toks = [], []
         try:
-            for x, s in ids:
+            for x, s, c in ids:
                 cur.clear()
-                margins.append(self.model.yesno(x, s)["m"])
+                margins.append(self.model.yesno(x, s, c)["m"])
                 sel = (slice(None) if pos == "all" else [-1] if pos == "last" else list(pos))
                 for m in mods:
                     t = cur[m][0]
@@ -217,6 +270,22 @@ class State:
         self.log({"cmd": "acts", "n": len(ids), "modules": mods, "file": str(path)})
         return {"text": f"saved {path} ({len(ids)} prompts x {len(mods)} modules); "
                         f"budget left {self.budget_left()}", "path": str(path)}
+
+    def cmd_attrib(self, req):
+        prompts, ids = self._probe(req)
+        units = list(req.get("units", []))
+        rows = [self.model.attrib(x, units, c, s) for x, s, c in ids]
+        names = list(rows[0]["blocks"])
+        path = self.out / "acts" / f"attrib_{time.strftime('%H%M%S')}_{len(list((self.out / 'acts').glob('*.pt'))):04d}.pt"
+        torch.save({"prompts": prompts, "blocks": names,
+                    "contrib": torch.tensor([[r["blocks"][n] for n in names] for r in rows]),
+                    "units": {u: torch.stack([r["units"][u] for r in rows]) for u in units},
+                    "yes_minus_no": [r["m"] for r in rows], "decomp_err": [r["decomp_err"] for r in rows],
+                    "rms": [r["rms"] for r in rows], "edit": self.active, "interventions": self.iv}, path)
+        self.log({"cmd": "attrib", "n": len(rows), "units": units, "file": str(path)})
+        return {"text": f"saved {path} ({len(rows)} prompts; contrib = prompts x {len(names)} blocks "
+                        f"[embed, a0, m0, ...]; units: {units}); max decomposition error "
+                        f"{max(r['decomp_err'] for r in rows):.3g}; budget left {self.budget_left()}", "path": str(path)}
 
     def cmd_weights(self, req):
         names = req["names"]
@@ -264,6 +333,8 @@ def main():
     ap.add_argument("--limit-cases", type=int, default=0, help="smoke test: first N practice patients")
     ap.add_argument("--score-calls", type=int, default=0, help="override budget")
     ap.add_argument("--probe-prompts", type=int, default=0, help="override budget")
+    ap.add_argument("--target", default="asym", choices=["asym", "attractor"])
+    ap.add_argument("--profile", default="llama", help="attractor target profile (config.ATTRACTOR_PROFILES)")
     args = ap.parse_args()
 
     state = State(args)

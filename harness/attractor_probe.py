@@ -34,6 +34,7 @@ Output <out>/records.jsonl (ids + numbers only, no patient text; appended, a rer
 import argparse
 import json
 import math
+import random
 import re
 import time
 from pathlib import Path
@@ -51,8 +52,9 @@ IMG = ["ct_sigmoid", "ct_appendix", "us_appendix", "us_gallbladder", "ct_kidney_
 
 # ---- model hooks ------------------------------------------------------------------------------
 class Probe:
-    def __init__(self, R):
+    def __init__(self, R, head_layers=()):
         self.R, hf = R, R.hf
+        self.head_layers = set(head_layers)     # layers whose per-head attention share on history is kept
         cands = [n for n, _ in hf.named_modules() if re.fullmatch(r".*\.layers\.0", n) and "vision" not in n]
         self.prefix = cands[-1][:-2]
         base = hf.get_submodule(self.prefix.rsplit(".", 1)[0])
@@ -126,13 +128,38 @@ class Probe:
             lt = getattr(R.cfg, "layer_types", None)
             layer_ids = list(range(self.nL)) if len(atts) == self.nL else \
                 [i for i, t in enumerate(lt or []) if "full" in str(t)]
-            sh = [None] * self.nL
+            sh, shh = [None] * self.nL, {}
             if len(layer_ids) == len(atts):
                 for l, A in zip(layer_ids, atts):
                     if A is not None:
-                        sh[l] = float(A[0, :, -1, a0:a1].float().sum(-1).mean())
+                        per_head = A[0, :, -1, a0:a1].float().sum(-1)
+                        sh[l] = float(per_head.mean())
+                        if l in self.head_layers:
+                            shh[str(l)] = [float(v) for v in per_head]
             rec["att_hist"] = sh
+            if shh:
+                rec["att_hist_h"] = shh
         return rec
+
+
+def pick_mid(mids, cap, seed, tag):
+    """mids: [(hadm_id, disease)] of mid-prior patients for one test. cap 0 or >= len -> all of them.
+    Otherwise a disease-stratified random sample (proportional allocation, largest remainder), fixed seed.
+    (The first run took the first `cap` in pool order, which is sorted by disease -> biased subsets.)"""
+    if not cap or len(mids) <= cap:
+        return [h for h, _ in mids]
+    rng = random.Random(f"{seed}|{tag}")
+    by = {}
+    for h, d in mids:
+        by.setdefault(d, []).append(h)
+    quota = {d: cap * len(v) / len(mids) for d, v in by.items()}
+    take = {d: int(q) for d, q in quota.items()}
+    for d in sorted(by, key=lambda d: quota[d] - take[d], reverse=True)[:cap - sum(take.values())]:
+        take[d] += 1
+    out = []
+    for d in sorted(by):
+        out += rng.sample(by[d], take[d])
+    return out
 
 
 def hist_span(text, hist):
@@ -165,7 +192,9 @@ def analyse(recs, names, blank):
                 a_ = float(mS.mean() - s_ * mB.mean())
                 delta = [slope(mB, CS[:, j]) - slope(mB, CB[:, j]) for j in range(len(names))]
                 uB = np.array([r["B"]["m_unnorm"] for r in rs]); uS = np.array([s["m_unnorm"] for s in S])
+                # spread = SD(F)/SD(B): < 1 compression; pull with spread ~1 = reordering by things other than B
                 c = {"test": t, "wording": w, "side": side, "n": len(rs), "s": s_, "pull": 1 - s_, "a": a_,
+                     "spread": float(mS.std() / mB.std()),
                      "L": a_ / (1 - s_) if s_ < 0.98 else None, "s_unnorm": slope(uB, uS),
                      "rms_ratio": float(np.mean([s["rms"] for s in S]) / np.mean([r["B"]["rms"] for r in rs])),
                      "delta": delta, "cum": list(np.cumsum(delta))}
@@ -173,6 +202,10 @@ def analyse(recs, names, blank):
                     ab = np.array([[np.nan if v is None else v for v in r["B"]["att_hist"]] for r in rs])
                     as_ = np.array([[np.nan if v is None else v for v in s["att_hist"]] for s in S])
                     c["att_B"], c["att_S"] = list(np.nanmean(ab, 0)), list(np.nanmean(as_, 0))
+                if "att_hist_h" in rs[0]["B"]:
+                    c["att_h"] = {l: {"B": list(np.mean([r["B"]["att_hist_h"][l] for r in rs], 0)),
+                                      "S": list(np.mean([s["att_hist_h"][l] for s in S], 0))}
+                                  for l in rs[0]["B"]["att_hist_h"]}
                 bk = f"{t}|{w}|{side}"
                 if bk in blank and f"{t}|B" in blank:
                     b0, f0 = blank[f"{t}|B"]["m"], blank[bk]["m"]
@@ -197,7 +230,8 @@ def report(cells, names, meta, out):
         med = np.median(D, 0)
         cum = np.median(np.array([c["cum"] for c in cs]), 0)
         L += [f"## {lab} ({len(cs)} cells)", "",
-              f"- median pull {np.median([c['pull'] for c in cs]):.2f}; median pull before final norm "
+              f"- median pull {np.median([c['pull'] for c in cs]):.2f}; median spread SD(F)/SD(B) "
+              f"{np.median([c['spread'] for c in cs]):.2f} (<1 compression, ~1 reordering); median pull before final norm "
               f"(1 − s_unnorm) {np.median([1 - c['s_unnorm'] for c in cs]):.2f}; "
               f"rms(result) / rms(no result) median {np.median([c['rms_ratio'] for c in cs]):.2f}", "",
               "Top erasers (median delta over cells; fraction of cells where it is negative):", "",
@@ -223,6 +257,14 @@ def report(cells, names, meta, out):
                   "| layer | " + " | ".join(str(l) for l in ls[::step]) + " |", "|---|" + "---|" * len(ls[::step]),
                   "| no result | " + " | ".join(f"{aB[l]:.2f}" for l in ls[::step]) + " |",
                   "| with result | " + " | ".join(f"{aS[l]:.2f}" for l in ls[::step]) + " |", ""]
+        if "att_h" in cs[0]:
+            for l in cs[0]["att_h"]:
+                hB = np.median(np.array([c["att_h"][l]["B"] for c in cs]), 0)
+                hS = np.median(np.array([c["att_h"][l]["S"] for c in cs]), 0)
+                L += [f"Per-head attention share on history, layer {l} (median over cells):", "",
+                      "| head | " + " | ".join(str(h) for h in range(len(hB))) + " |", "|---|" + "---|" * len(hB),
+                      "| no result | " + " | ".join(f"{v:.2f}" for v in hB) + " |",
+                      "| with result | " + " | ".join(f"{v:.2f}" for v in hS) + " |", ""]
         bl = [c for c in cs if "blank" in c]
         if bl:
             L += ["Blank history (consistency check): history-free point vs the cell's line and fixed point L", "",
@@ -232,11 +274,16 @@ def report(cells, names, meta, out):
                 L.append(f"| {c['test']}/{c['wording']} | {c['pull']:.2f} | {b['B0']:+.2f} | {b['F0']:+.2f} | "
                          f"{b['line_pred']:+.2f} | {b['resid']:+.2f} | {f2(c['L'])} |")
             L.append(f"\nmedian |resid| {np.median([abs(c['blank']['resid']) for c in bl]):.2f}\n")
-    L += ["## Per cell", "", "| cell | side | n | pull | pull pre-norm | top eraser | its delta |", "|---|---|---|---|---|---|---|"]
+    if meta.get("disease_mix"):
+        L += ["## Selected patients per test (disease mix)", ""]
+        L += [f"- {t}: " + ", ".join(f"{d} {n}" for d, n in sorted(mix.items())) for t, mix in meta["disease_mix"].items()]
+        L.append("")
+    L += ["## Per cell", "", "| cell | side | n | pull | spread | pull pre-norm | top eraser | its delta |",
+          "|---|---|---|---|---|---|---|---|"]
     for k, c in cells.items():
         j = int(np.argmin(c["delta"]))
-        L.append(f"| {c['test']}/{c['wording']} | {c['side']} | {c['n']} | {c['pull']:.2f} | {1 - c['s_unnorm']:.2f} | "
-                 f"{names[j]} | {c['delta'][j]:+.2f} |")
+        L.append(f"| {c['test']}/{c['wording']} | {c['side']} | {c['n']} | {c['pull']:.2f} | {c['spread']:.2f} | "
+                 f"{1 - c['s_unnorm']:.2f} | {names[j]} | {c['delta'][j]:+.2f} |")
     (out / "REPORT.md").write_text("\n".join(L) + "\n")
     (out / "report.json").write_text(json.dumps({"meta": meta, "names": names, "cells": cells}, default=float))
     print("\n".join(L[:80]))
@@ -249,22 +296,26 @@ def main():
     ap.add_argument("--out", required=True)
     ap.add_argument("--pool", default="data/sigmoid_pool.jsonl")
     ap.add_argument("--question", default="orig")
-    ap.add_argument("--max-per-test", type=int, default=80, help="mid-prior patients per test (cap)")
+    ap.add_argument("--max-per-test", type=int, default=80,
+                    help="mid-prior patients per test; above this a disease-stratified random sample (0 = all)")
+    ap.add_argument("--seed", type=int, default=0)
+    ap.add_argument("--head-layers", default="", help="e.g. 27: also keep per-head attention share on history")
     ap.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     ap.add_argument("--from-saved", action="store_true")
     args = ap.parse_args()
     out = Path(args.out)
     out.mkdir(parents=True, exist_ok=True)
     rpath, bpath, npath = out / "records.jsonl", out / "blank.json", out / "names.json"
+    sel_path = out / "selection.json"
 
     if not args.from_saved:
         items = build_items(args.pool, 0, args.question)
+        dz = {it["hadm_id"]: it["true_disease"] for it in items}
         R = Runner(args.model, args.device, 1)
-        P = Probe(R)
+        P = Probe(R, [int(x) for x in args.head_layers.split(",") if x])
         npath.write_text(json.dumps({"names": P.names, "model": args.model, "attn": P.attn_ok}))
         t0 = time.time()
         # phase 1: no-result prompt for everyone -> mid-prior patients per test
-        sel_path = out / "selection.json"
         if sel_path.exists():
             sel = json.loads(sel_path.read_text())
         else:
@@ -274,10 +325,11 @@ def main():
                 for it in items:
                     m = R.margins([it["tests"][t]["B"]])[0]["m"]
                     if LO < m < HI:
-                        mids.append(it["hadm_id"])
-                sel[t] = mids[:args.max_per_test]
+                        mids.append((it["hadm_id"], it["true_disease"]))
+                sel[t] = pick_mid(mids, args.max_per_test, args.seed, t)
                 print(f"{t}: {len(mids)} mid-prior, using {len(sel[t])} ({(time.time() - t0) / 60:.1f} min)", flush=True)
             sel_path.write_text(json.dumps(sel))
+            (out / "selection_dz.json").write_text(json.dumps({t: {str(h): dz[h] for h in v} for t, v in sel.items()}))
         # phase 3 first (cheap): blank history
         if not bpath.exists():
             blank, it = {}, items[0]
@@ -314,6 +366,10 @@ def main():
     errs = [r["tests"][t]["B"]["decomp_err"] for r in recs for t in r["tests"]]
     meta = {"model": json.loads(npath.read_text())["model"], "n_patients": len(recs),
             "decomp_err_max": max(errs) if errs else float("nan")}
+    dzp = out / "selection_dz.json"
+    if dzp.exists():
+        from collections import Counter
+        meta["disease_mix"] = {t: dict(Counter(v.values())) for t, v in json.loads(dzp.read_text()).items()}
     report(analyse(recs, names, blank), names, meta, out)
 
 

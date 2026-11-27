@@ -424,3 +424,26 @@ BUDGET = {
     "probe_prompts": 4000,  # prompts run through /logits and /acts, summed
 }
 MAX_PROBE_PER_CALL = 256
+
+# ---- attractor target (SPEC_attractor_harness.md, fixed 2026-11-27) ------------------------------
+# Per cell (test, wording, side), mid-prior cases, push d = F - B = move - p*(B - mean B) + r.
+#   target:      median |p| over target cells (pull)  -> success if <= success_ratio * original
+#   constraints: every cell's move within move_tol (relative; floor move_floor for small moves),
+#                no target test's median |p| worse by > test_worse, no target cell p < p_floor,
+#                non-target side: |median p change| < other_side_dp, guards (drift, general, nll, mass)
+ATTRACTOR = {"success_ratio": 0.5, "test_worse": 0.1, "p_floor": -0.2, "move_tol": 0.15, "move_floor": 0.5,
+             "other_side_dp": 0.1, "drift_max": 0.15, "nll_max": 0.01, "mass_drop": 0.02, "n_min": 12}
+# target sides per model; cells of `exclude_tests` whose wording matches `exclude_wordings` are reported but
+# not targeted (Llama: numeric lab wordings are a separate, missing ability - PIPELINE.md change log (e))
+ATTRACTOR_PROFILES = {
+    "llama": {"target_sides": "PN", "exclude_tests": ["lipase", "amylase", "troponin_mi", "ntprobnp_hf", "ddimer_pe"],
+              "exclude_wordings": r"^(new_)?numeric$"},
+    "qwen": {"target_sides": "N", "exclude_tests": [], "exclude_wordings": None},
+}
+# which disease each test asks about (AUC report item); None = not one of the pool's diseases
+TEST_DISEASE = {"ct_sigmoid": "diverticulitis", "ct_appendix": "appendicitis", "us_appendix": "appendicitis",
+                "us_gallbladder": "cholecystitis", "lipase": "pancreatitis", "amylase": "pancreatitis",
+                "ct_kidney_stone": None,
+                "tte_rwma_mi": "acute_mi", "troponin_mi": "acute_mi", "tte_rv_pe": "pulmonary_embolism",
+                "ctpa_pe": "pulmonary_embolism", "ddimer_pe": "pulmonary_embolism", "cxr_hf": "heart_failure",
+                "lus_hf": "heart_failure", "ntprobnp_hf": "heart_failure", "cxr_pneumonia": "pneumonia"}
